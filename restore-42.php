@@ -6,11 +6,11 @@
  */
 
 define('RESTORE_VERSION', '1.0.0');
+define('STORED_PASS_HASH', ''); // self-updated on first login — do not edit this line
 define('WORK_DIR', __DIR__ . '/restore_work');
 define('UPLOADS_DIR', WORK_DIR . '/uploads');
 define('EXTRACT_DIR', WORK_DIR . '/extract');
 define('BACKUPS_DIR', __DIR__ . '/restore_backups');
-define('PASSWORD_FILE', WORK_DIR . '/.password');
 define('STATE_FILE', WORK_DIR . '/.state');
 
 error_reporting(E_ALL);
@@ -23,6 +23,7 @@ session_start();
 foreach ([WORK_DIR, UPLOADS_DIR, EXTRACT_DIR] as $d) {
     if (!is_dir($d)) mkdir($d, 0755, true);
 }
+// Protect work dir from direct web access
 $htFile = WORK_DIR . '/.htaccess';
 if (!file_exists($htFile)) file_put_contents($htFile, 'Deny from all');
 
@@ -64,19 +65,43 @@ function requireAuth(): void {
 }
 
 function handleLogin(): void {
-    $pw = trim($_POST['password'] ?? '');
-    $hash = file_exists(PASSWORD_FILE) ? trim(file_get_contents(PASSWORD_FILE)) : null;
-    if ($hash === null) {
+    $pw   = trim($_POST['password'] ?? '');
+    $hash = STORED_PASS_HASH;
+
+    if ($hash === '') {
+        // First run: embed hash into own source
         if (strlen($pw) < 6) jsonErr('Password must be at least 6 characters');
-        file_put_contents(PASSWORD_FILE, password_hash($pw, PASSWORD_BCRYPT));
+        $newHash = password_hash($pw, PASSWORD_BCRYPT);
+        $written = selfEmbedHash($newHash);
         $_SESSION['ra'] = true;
-        jsonOk(['first_run' => true]);
+        jsonOk(['first_run' => true, 'self_written' => $written,
+                'warn' => $written ? null : 'Could not write password into script file — make it writable by the web server (chmod 644).']);
     }
+
     if (password_verify($pw, $hash)) {
         $_SESSION['ra'] = true;
         jsonOk(['first_run' => false]);
     }
     jsonErr('Invalid password');
+}
+
+function selfEmbedHash(string $hash): bool {
+    $file   = __FILE__;
+    $source = file_get_contents($file);
+    $count  = 0;
+    // Use callback to avoid $ backreference interpretation in bcrypt hashes
+    $updated = preg_replace_callback(
+        "/^define\('STORED_PASS_HASH',\s*'[^']*'\);.*$/m",
+        function () use ($hash, &$count): string {
+            $count++;
+            return "define('STORED_PASS_HASH', '{$hash}'); // self-updated on first login — do not edit this line";
+        },
+        $source,
+        1
+    );
+    if (!$count || $updated === null) return false;
+    if (!is_writable($file)) return false;
+    return file_put_contents($file, $updated) !== false;
 }
 
 function handleLogout(): void { session_destroy(); jsonOk(); }
