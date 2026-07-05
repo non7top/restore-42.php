@@ -1120,10 +1120,8 @@ const CHUNK = 5 * 1024 * 1024;
 
 async function uploadFile(file) {
   // Only strip chars unsafe on filesystems; preserve UTF-8 (Cyrillic, CJK, etc.)
-  const name = file.name.replace(/[\x00-\x1f/\\:*?"<>|]/g, '_').replace(/^[. ]+|[. ]+$/g, '') || 'upload';
   const chunks = Math.ceil(file.size / CHUNK) || 1;
   const wrap = document.getElementById('upload-progress');
-  // Use a random id — filename may contain chars invalid in CSS selectors
   const pbId = 'pb-' + Math.random().toString(36).slice(2);
 
   const div = document.createElement('div');
@@ -1131,19 +1129,47 @@ async function uploadFile(file) {
   div.innerHTML = `<span class="file-icon">⬆️</span><div class="file-info">
     <div class="file-name">${escHtml(file.name)}</div>
     <div class="progress-wrap"><div class="progress-bar" id="${pbId}" style="width:0"></div></div>
-  </div>`;
+    <div class="file-meta" id="${pbId}-meta" style="margin-top:4px;font-size:12px;color:#94a3b8">Starting…</div>
+  </div>
+  <button class="btn btn-secondary btn-sm" id="${pbId}-cancel" style="margin-left:8px" title="Cancel">✕</button>`;
   wrap.appendChild(div);
 
+  let cancelled = false;
+  let ctrl = null;
+  document.getElementById(`${pbId}-cancel`).onclick = () => { cancelled = true; ctrl?.abort(); };
+
+  const started = Date.now();
+  let bytesDone = 0;
+
   for (let c = 0; c < chunks; c++) {
+    if (cancelled) break;
+    ctrl = new AbortController();
     const fd = new FormData();
     fd.append('file', file.slice(c * CHUNK, (c+1) * CHUNK), file.name);
     fd.append('chunk', c); fd.append('chunks', chunks);
-    await fetch(API('upload'), {method:'POST', body: fd});
+    try { await fetch(API('upload'), {method:'POST', body: fd, signal: ctrl.signal}); }
+    catch { break; }
+    bytesDone += Math.min(CHUNK, file.size - c * CHUNK);
+    const pct = Math.round((c + 1) / chunks * 100);
+    const elapsed = (Date.now() - started) / 1000 || 0.001;
+    const speed = bytesDone / elapsed;
+    const left = (file.size - bytesDone) / speed;
     const pb = document.getElementById(pbId);
-    if (pb) pb.style.width = Math.round((c+1)/chunks*100) + '%';
+    const meta = document.getElementById(`${pbId}-meta`);
+    if (pb) pb.style.width = pct + '%';
+    if (meta) meta.textContent = `${pct}% · ${fmtSize(speed)}/s · ${fmtTime(left)} left`;
   }
 
-  div.querySelector('.file-icon').textContent = '✅';
+  document.getElementById(`${pbId}-cancel`)?.remove();
+  const meta = document.getElementById(`${pbId}-meta`);
+  if (cancelled) {
+    div.querySelector('.file-icon').textContent = '🚫';
+    if (meta) meta.textContent = 'Cancelled';
+  } else {
+    div.querySelector('.file-icon').textContent = '✅';
+    const total = (Date.now() - started) / 1000;
+    if (meta) meta.textContent = `Done · ${fmtSize(file.size)} in ${fmtTime(total)}`;
+  }
   await loadFileList();
 }
 
@@ -1370,6 +1396,12 @@ function fmtSize(b) {
   return b + ' B';
 }
 function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function fmtTime(s) {
+  if (!isFinite(s) || s < 0) return '…';
+  if (s < 60) return Math.round(s) + 's';
+  if (s < 3600) return Math.floor(s / 60) + 'm ' + Math.round(s % 60) + 's';
+  return Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
+}
 
 init();
 </script>
