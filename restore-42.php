@@ -613,7 +613,7 @@ function handleBackup(): void {
     $archive = $base . '.tar.gz';
     $excludes = ' --exclude=' . escapeshellarg(basename(WORK_DIR))
               . ' --exclude=' . escapeshellarg(basename(BACKUPS_DIR))
-              . ' --exclude=restore-42.php';
+              . ' --exclude=' . escapeshellarg(basename(__FILE__));
     $tarCmd = "tar -czf " . escapeshellarg($archive) . $excludes .
               " -C " . escapeshellarg(dirname($rootDir)) . " " . escapeshellarg(basename($rootDir)) . " 2>&1";
     exec($tarCmd, $o, $ret);
@@ -694,7 +694,7 @@ function showHtml(): never { ?>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>restore-42.php <?= RESTORE_VERSION ?></title>
+<title><?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?> <?= RESTORE_VERSION ?></title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font:14px/1.5 'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}
@@ -789,7 +789,7 @@ select option{background:#1a1d27}
 
 <div id="auth-screen" style="display:none">
   <div class="auth-box">
-    <h2>restore-42.php</h2>
+    <h2><?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?></h2>
     <p id="auth-hint">Loading…</p>
     <input type="password" id="auth-pw" placeholder="Password" autocomplete="current-password">
     <button class="btn btn-primary" style="width:100%" onclick="doLogin()">Continue</button>
@@ -976,8 +976,8 @@ select option{background:#1a1d27}
           <div class="panel" style="text-align:center;padding:48px">
             <div style="font-size:48px;margin-bottom:16px">✅</div>
             <h2 style="margin-bottom:8px">Restore complete</h2>
-            <p style="color:#64748b;margin-bottom:24px">Check the site, then delete <code>restore-42.php</code> and the <code>restore_work/</code> directory.</p>
-            <button class="btn btn-danger" onclick="if(confirm('Delete restore-42.php?'))alert('Delete it manually — this tool cannot delete itself safely.')">Delete restore-42.php</button>
+            <p style="color:#64748b;margin-bottom:24px">Check the site, then delete <code><?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?></code> and the <code>restore_work/</code> directory.</p>
+            <button class="btn btn-danger" onclick="if(confirm('Delete <?= htmlspecialchars(basename(__FILE__), ENT_JS) ?>?'))alert('Delete it manually — this tool cannot delete itself safely.')">Delete <?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?></button>
           </div>
         </div>
 
@@ -1020,7 +1020,7 @@ select option{background:#1a1d27}
 </div><!-- /main-app -->
 
 <script>
-const API = loc => 'restore-42.php?action=' + loc;
+const API = loc => '<?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?>?action=' + loc;
 let state = {step: 1, uploadMode: 'archive', extracted: false, sqlImported: false};
 let fwData = {};
 
