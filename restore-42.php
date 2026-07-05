@@ -130,7 +130,9 @@ function handleSetState(): void {
 function handleUpload(): void {
     if (empty($_FILES['file'])) jsonErr('No file');
     $f = $_FILES['file'];
-    $name = preg_replace('/[^a-zA-Z0-9._\-]/', '_', basename($f['name']));
+    // Strip only chars unsafe on common filesystems; preserve UTF-8 (Cyrillic, CJK, etc.)
+    $name = preg_replace('/[\x00-\x1f\/\\\\:*?"<>|]/', '_', basename($f['name']));
+    $name = trim($name, '. ') ?: 'upload';
     $chunk  = (int)($_POST['chunk']  ?? 0);
     $chunks = (int)($_POST['chunks'] ?? 1);
     $dest = UPLOADS_DIR . '/' . $name;
@@ -1117,15 +1119,18 @@ function uploadFiles(files) {
 const CHUNK = 5 * 1024 * 1024;
 
 async function uploadFile(file) {
-  const name = file.name.replace(/[^a-zA-Z0-9._\-]/g,'_');
+  // Only strip chars unsafe on filesystems; preserve UTF-8 (Cyrillic, CJK, etc.)
+  const name = file.name.replace(/[\x00-\x1f/\\:*?"<>|]/g, '_').replace(/^[. ]+|[. ]+$/g, '') || 'upload';
   const chunks = Math.ceil(file.size / CHUNK) || 1;
   const wrap = document.getElementById('upload-progress');
+  // Use a random id — filename may contain chars invalid in CSS selectors
+  const pbId = 'pb-' + Math.random().toString(36).slice(2);
 
   const div = document.createElement('div');
   div.className = 'file-item';
   div.innerHTML = `<span class="file-icon">⬆️</span><div class="file-info">
-    <div class="file-name">${name}</div>
-    <div class="progress-wrap"><div class="progress-bar" id="pb-${name}" style="width:0"></div></div>
+    <div class="file-name">${escHtml(file.name)}</div>
+    <div class="progress-wrap"><div class="progress-bar" id="${pbId}" style="width:0"></div></div>
   </div>`;
   wrap.appendChild(div);
 
@@ -1134,9 +1139,8 @@ async function uploadFile(file) {
     fd.append('file', file.slice(c * CHUNK, (c+1) * CHUNK), file.name);
     fd.append('chunk', c); fd.append('chunks', chunks);
     await fetch(API('upload'), {method:'POST', body: fd});
-    const pct = Math.round((c+1)/chunks*100);
-    const pb = document.getElementById('pb-' + name);
-    if (pb) pb.style.width = pct + '%';
+    const pb = document.getElementById(pbId);
+    if (pb) pb.style.width = Math.round((c+1)/chunks*100) + '%';
   }
 
   div.querySelector('.file-icon').textContent = '✅';
@@ -1365,6 +1369,7 @@ function fmtSize(b) {
   if (b >= 1024)       return (b/1024).toFixed(2) + ' KB';
   return b + ' B';
 }
+function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
 init();
 </script>
