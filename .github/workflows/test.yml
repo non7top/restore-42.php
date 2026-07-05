@@ -70,6 +70,29 @@ jobs:
           echo "$resp"
           echo "$resp" | grep -q '"done":true'
 
+      - name: Test — multi-chunk upload assembles correct file size
+        run: |
+          # Create a 12 MB file (3 chunks of 5 MB + 1 of 2 MB) and upload in chunks.
+          # Verifies that startup-cleanup does NOT delete in-progress chunks,
+          # and that the assembled file matches the original size exactly.
+          dd if=/dev/urandom of=/tmp/big.bin bs=1M count=12 2>/dev/null
+          FILESIZE=$(stat -c%s /tmp/big.bin)
+          CHUNK=5242880
+          CHUNKS=$(( (FILESIZE + CHUNK - 1) / CHUNK ))
+          for i in $(seq 0 $((CHUNKS - 1))); do
+            START=$((i * CHUNK))
+            dd if=/tmp/big.bin bs=1 skip=$START count=$CHUNK of=/tmp/part_$i 2>/dev/null
+            resp=$(curl -sf -c /tmp/jar -b /tmp/jar -X POST \
+              'http://127.0.0.1:8080/restore-42.php?action=upload' \
+              -F "chunk=$i" -F "chunks=$CHUNKS" \
+              -F "file=@/tmp/part_$i;filename=big.bin")
+            echo "chunk $i: $resp"
+          done
+          # Verify assembled size matches original
+          ASSEMBLED=$(stat -c%s .restore/uploads/big.bin)
+          echo "Original: $FILESIZE  Assembled: $ASSEMBLED"
+          [ "$ASSEMBLED" -eq "$FILESIZE" ]
+
       - name: Test — list_files shows uploaded file (no .chunk files)
         run: |
           resp=$(curl -sf -c /tmp/jar -b /tmp/jar \

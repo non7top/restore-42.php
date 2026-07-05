@@ -31,9 +31,12 @@ $htFile = WORK_DIR . '/.htaccess';
 if (!file_exists($htFile)) {
     file_put_contents($htFile, 'Deny from all');
 }
-// Clean up orphaned chunk files left by interrupted uploads
+// Clean up chunk files abandoned for more than 1 hour (truly orphaned).
+// Do NOT delete recent chunks — they belong to an upload that is in progress.
 foreach (glob(UPLOADS_DIR . '/*.chunk*') ?: [] as $orphan) {
-    unlink($orphan);
+    if (time() - filemtime($orphan) > 3600) {
+        unlink($orphan);
+    }
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
