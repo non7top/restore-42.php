@@ -543,10 +543,13 @@ function handleImportSql(): void
 
     try {
         $pdo = dbConnect($host, $user, $pass, $port);
-        if (!empty($_POST['create_db']) && $db) {
-            $pdo->exec("CREATE DATABASE IF NOT EXISTS `{$db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
-        }
         if ($db) {
+            if (!empty($_POST['clean_db'])) {
+                $pdo->exec("DROP DATABASE IF EXISTS `{$db}`");
+                $pdo->exec("CREATE DATABASE `{$db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+            } elseif (!empty($_POST['create_db'])) {
+                $pdo->exec("CREATE DATABASE IF NOT EXISTS `{$db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+            }
             $pdo->exec("USE `{$db}`");
         }
     } catch (Throwable $e) {
@@ -1196,6 +1199,12 @@ select option{background:#1a1d27}
                 <input id="sql-path" placeholder="/path/to/dump.sql">
               </div>
             </div>
+            <div style="margin:12px 0 8px;padding:10px 12px;border-radius:6px;background:#450a0a22;border:1px solid #7f1d1d44">
+              <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin:0">
+                <input type="checkbox" id="db-clean" style="width:auto;accent-color:#ef4444">
+                <span style="color:#fca5a5;font-size:13px;font-weight:500">⚠️ Clean database first — DROP all existing tables before import</span>
+              </label>
+            </div>
             <button class="btn btn-primary" onclick="doImportSql()" id="btn-import-sql">Import SQL</button>
             <div id="sql-log" class="log" style="display:none"></div>
           </div>
@@ -1565,10 +1574,20 @@ async function testDb() {
 async function doImportSql() {
   const sql = document.getElementById('sql-path').value.trim();
   if (!sql) return alert('Specify SQL file path');
+  const cleanDb = document.getElementById('db-clean').checked;
+  if (cleanDb) {
+    const dbName = document.getElementById('db-name').value;
+    if (!confirm(`DROP all tables in \`${dbName}\` before import?\n\nALL EXISTING DATA WILL BE LOST. This cannot be undone.`)) return;
+  }
   const log = document.getElementById('sql-log');
   log.style.display = ''; log.innerHTML = '<div class="log-line log-info">Importing…</div>';
 
-  const r = await post('import_sql', {...dbParams(), sql_file: sql, create_db: document.getElementById('db-create').checked ? '1' : ''});
+  const r = await post('import_sql', {
+    ...dbParams(),
+    sql_file: sql,
+    create_db: document.getElementById('db-create').checked ? '1' : '',
+    clean_db: cleanDb ? '1' : '',
+  });
   log.innerHTML += r.ok
     ? `<div class="log-line log-ok">Imported via ${r.method}</div>`
     : `<div class="log-line log-err">${r.error}</div>`;
