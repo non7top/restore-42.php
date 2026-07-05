@@ -26,6 +26,8 @@ foreach ([WORK_DIR, UPLOADS_DIR, EXTRACT_DIR] as $d) {
 // Protect work dir from direct web access
 $htFile = WORK_DIR . '/.htaccess';
 if (!file_exists($htFile)) file_put_contents($htFile, 'Deny from all');
+// Clean up orphaned chunk files left by interrupted uploads
+foreach (glob(UPLOADS_DIR . '/*.chunk*') ?: [] as $orphan) { unlink($orphan); }
 
 // ── Router ────────────────────────────────────────────────────────────────────
 
@@ -1025,6 +1027,10 @@ select option{background:#1a1d27}
 const API = loc => '<?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?>?action=' + loc;
 let state = {step: 1, uploadMode: 'archive', extracted: false, sqlImported: false};
 let fwData = {};
+let uploadsInProgress = 0;
+window.addEventListener('beforeunload', e => {
+  if (uploadsInProgress > 0) { e.preventDefault(); e.returnValue = ''; }
+});
 
 // ── Auth ─────────────────────────────────────────────────────────────────────
 
@@ -1140,8 +1146,9 @@ async function uploadFile(file) {
 
   const started = Date.now();
   let bytesDone = 0;
+  uploadsInProgress++;
 
-  for (let c = 0; c < chunks; c++) {
+  try { for (let c = 0; c < chunks; c++) {
     if (cancelled) break;
     ctrl = new AbortController();
     const fd = new FormData();
@@ -1158,7 +1165,7 @@ async function uploadFile(file) {
     const meta = document.getElementById(`${pbId}-meta`);
     if (pb) pb.style.width = pct + '%';
     if (meta) meta.textContent = `${pct}% · ${fmtSize(speed)}/s · ${fmtTime(left)} left`;
-  }
+  } } finally { uploadsInProgress--; }
 
   document.getElementById(`${pbId}-cancel`)?.remove();
   const meta = document.getElementById(`${pbId}-meta`);
