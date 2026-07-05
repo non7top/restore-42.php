@@ -96,6 +96,9 @@ switch ($action) {
     case 'delete_file':
         handleDeleteFile();
         break;
+    case 'cancel_upload':
+        handleCancelUpload();
+        break;
     case 'download_backup':
         handleDownloadBackup();
         break;
@@ -234,13 +237,24 @@ function handleUpload(): void
 function handleListFiles(): void
 {
     $files = [];
-    foreach (glob(UPLOADS_DIR . '/*') as $f) {
-        if (!is_file($f)) {
+    foreach (glob(UPLOADS_DIR . '/*') ?: [] as $f) {
+        if (!is_file($f) || str_contains(basename($f), '.chunk')) {
             continue;
         }
         $files[] = ['name' => basename($f), 'size' => filesize($f), 'type' => detectUploadType($f)];
     }
     jsonOk(['files' => $files]);
+}
+
+function handleCancelUpload(): void
+{
+    $name = basename($_POST['file'] ?? '');
+    if ($name) {
+        foreach (glob(UPLOADS_DIR . '/' . $name . '.chunk*') ?: [] as $chunk) {
+            unlink($chunk);
+        }
+    }
+    jsonOk([]);
 }
 
 function handleDeleteFile(): void
@@ -1421,6 +1435,8 @@ async function uploadFile(file) {
   wrap.appendChild(div);
 
   let cancelled = false;
+  let failed = false;
+  let failReason = '';
   let ctrl = null;
   document.getElementById(`${pbId}-cancel`).onclick = () => { cancelled = true; ctrl?.abort(); };
 
@@ -1434,8 +1450,13 @@ async function uploadFile(file) {
     const fd = new FormData();
     fd.append('file', file.slice(c * CHUNK, (c+1) * CHUNK), file.name);
     fd.append('chunk', c); fd.append('chunks', chunks);
-    try { await fetch(API('upload'), {method:'POST', body: fd, signal: ctrl.signal}); }
-    catch { break; }
+    let resp;
+    try { resp = await fetch(API('upload'), {method:'POST', body: fd, signal: ctrl.signal}); }
+    catch(e) {
+      if (!cancelled) { failed = true; failReason = e.message || 'Network error'; }
+      break;
+    }
+    if (!resp.ok) { failed = true; failReason = `Server error ${resp.status}`; break; }
     bytesDone += Math.min(CHUNK, file.size - c * CHUNK);
     const pct = Math.round((c + 1) / chunks * 100);
     const elapsed = (Date.now() - started) / 1000 || 0.001;
@@ -1449,9 +1470,31 @@ async function uploadFile(file) {
 
   document.getElementById(`${pbId}-cancel`)?.remove();
   const meta = document.getElementById(`${pbId}-meta`);
-  if (cancelled) {
+
+  if (failed || cancelled) {
+    post('cancel_upload', {file: file.name});
+  }
+
+  if (failed) {
+    div.querySelector('.file-icon').textContent = '❌';
+    const pb = document.getElementById(pbId);
+    if (pb) pb.style.background = '#ef4444';
+    if (meta) {
+      meta.textContent = `Failed: ${failReason} · `;
+      const btn = document.createElement('button');
+      btn.className = 'btn btn-secondary btn-sm'; btn.style.padding = '1px 8px'; btn.textContent = 'Retry';
+      btn.onclick = () => { div.remove(); uploadFile(file); };
+      meta.appendChild(btn);
+    }
+  } else if (cancelled) {
     div.querySelector('.file-icon').textContent = '🚫';
-    if (meta) meta.textContent = 'Cancelled';
+    if (meta) {
+      meta.textContent = 'Cancelled · ';
+      const btn = document.createElement('button');
+      btn.className = 'btn btn-secondary btn-sm'; btn.style.padding = '1px 8px'; btn.textContent = 'Retry';
+      btn.onclick = () => { div.remove(); uploadFile(file); };
+      meta.appendChild(btn);
+    }
   } else {
     div.querySelector('.file-icon').textContent = '✅';
     const total = (Date.now() - started) / 1000;

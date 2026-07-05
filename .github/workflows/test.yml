@@ -70,12 +70,26 @@ jobs:
           echo "$resp"
           echo "$resp" | grep -q '"done":true'
 
-      - name: Test — list_files shows uploaded file
+      - name: Test — list_files shows uploaded file (no .chunk files)
         run: |
           resp=$(curl -sf -c /tmp/jar -b /tmp/jar \
             'http://127.0.0.1:8080/restore-42.php?action=list_files')
           echo "$resp"
           echo "$resp" | grep -q 'smoke.sql'
+          echo "$resp" | grep -qv '\.chunk'
+
+      - name: Test — cancel_upload cleans partial chunks
+        run: |
+          # Simulate a leftover chunk file and verify cancel_upload removes it
+          touch .restore/uploads/orphan.tar.gz.chunk0
+          touch .restore/uploads/orphan.tar.gz.chunk1
+          resp=$(curl -sf -c /tmp/jar -b /tmp/jar -X POST \
+            'http://127.0.0.1:8080/restore-42.php?action=cancel_upload' \
+            -d 'file=orphan.tar.gz')
+          echo "$resp"
+          echo "$resp" | grep -q '"ok":true'
+          [ ! -f .restore/uploads/orphan.tar.gz.chunk0 ]
+          [ ! -f .restore/uploads/orphan.tar.gz.chunk1 ]
 
       - name: Test — test_db connects to MariaDB
         run: |
