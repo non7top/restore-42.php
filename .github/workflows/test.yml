@@ -1,0 +1,145 @@
+name: Test
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+
+    services:
+      db:
+        image: mariadb:11
+        env:
+          MARIADB_ROOT_PASSWORD: root
+          MARIADB_DATABASE: testdb
+          MARIADB_USER: testuser
+          MARIADB_PASSWORD: testpass
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.5"
+          extensions: pdo, pdo_mysql, zip
+          coverage: none
+
+      - name: Install mariadb-client
+        run: sudo apt-get install -y mariadb-client
+
+      - name: Start built-in PHP server
+        run: |
+          mkdir -p .restore/uploads .restore/extract .restore/backups
+          php -S 127.0.0.1:8080 restore-42.php &
+          sleep 1
+
+      - name: Test — auth (first run sets password)
+        run: |
+          resp=$(curl -sf -c /tmp/jar -b /tmp/jar -X POST \
+            'http://127.0.0.1:8080/restore-42.php?action=login' \
+            -d 'password=testpass123')
+          echo "$resp"
+          echo "$resp" | grep -q '"ok":true'
+
+      - name: Test — check_auth returns true
+        run: |
+          resp=$(curl -sf -c /tmp/jar -b /tmp/jar \
+            'http://127.0.0.1:8080/restore-42.php?action=check_auth')
+          echo "$resp"
+          echo "$resp" | grep -q '"auth":true'
+
+      - name: Test — upload SQL file
+        run: |
+          printf 'CREATE TABLE smoke (id INT PRIMARY KEY, v VARCHAR(50));\nINSERT INTO smoke VALUES (1,"ok");\n' \
+            > /tmp/smoke.sql
+          resp=$(curl -sf -c /tmp/jar -b /tmp/jar -X POST \
+            'http://127.0.0.1:8080/restore-42.php?action=upload' \
+            -F 'file=@/tmp/smoke.sql')
+          echo "$resp"
+          echo "$resp" | grep -q '"done":true'
+
+      - name: Test — multi-chunk upload assembles correct file size
+        run: |
+          # Create a 12 MB file (3 chunks of 5 MB + 1 of 2 MB) and upload in chunks.
+          # Verifies that startup-cleanup does NOT delete in-progress chunks,
+          # and that the assembled file matches the original size exactly.
+          dd if=/dev/urandom of=/tmp/big.bin bs=1M count=12 2>/dev/null
+          FILESIZE=$(stat -c%s /tmp/big.bin)
+          CHUNK=5242880
+          CHUNKS=$(( (FILESIZE + CHUNK - 1) / CHUNK ))
+          for i in $(seq 0 $((CHUNKS - 1))); do
+            START=$((i * CHUNK))
+            dd if=/tmp/big.bin bs=1 skip=$START count=$CHUNK of=/tmp/part_$i 2>/dev/null
+            resp=$(curl -sf -c /tmp/jar -b /tmp/jar -X POST \
+              'http://127.0.0.1:8080/restore-42.php?action=upload' \
+              -F "chunk=$i" -F "chunks=$CHUNKS" \
+              -F "file=@/tmp/part_$i;filename=big.bin")
+            echo "chunk $i: $resp"
+          done
+          # Verify assembled size matches original
+          ASSEMBLED=$(stat -c%s .restore/uploads/big.bin)
+          echo "Original: $FILESIZE  Assembled: $ASSEMBLED"
+          [ "$ASSEMBLED" -eq "$FILESIZE" ]
+
+      - name: Test — list_files shows uploaded file (no .chunk files)
+        run: |
+          resp=$(curl -sf -c /tmp/jar -b /tmp/jar \
+            'http://127.0.0.1:8080/restore-42.php?action=list_files')
+          echo "$resp"
+          echo "$resp" | grep -q 'smoke.sql'
+          echo "$resp" | grep -qv '\.chunk'
+
+      - name: Test — cancel_upload cleans partial chunks
+        run: |
+          # Simulate a leftover chunk file and verify cancel_upload removes it
+          touch .restore/uploads/orphan.tar.gz.chunk0
+          touch .restore/uploads/orphan.tar.gz.chunk1
+          resp=$(curl -sf -c /tmp/jar -b /tmp/jar -X POST \
+            'http://127.0.0.1:8080/restore-42.php?action=cancel_upload' \
+            -d 'file=orphan.tar.gz')
+          echo "$resp"
+          echo "$resp" | grep -q '"ok":true'
+          [ ! -f .restore/uploads/orphan.tar.gz.chunk0 ]
+          [ ! -f .restore/uploads/orphan.tar.gz.chunk1 ]
+
+      - name: Test — test_db connects to MariaDB
+        run: |
+          resp=$(curl -sf -c /tmp/jar -b /tmp/jar -X POST \
+            'http://127.0.0.1:8080/restore-42.php?action=test_db' \
+            -d 'db_host=127.0.0.1&db_port=3306&db_user=testuser&db_pass=testpass&db_name=testdb')
+          echo "$resp"
+          echo "$resp" | grep -q '"ok":true'
+
+      - name: Test — import SQL
+        run: |
+          sql_path="$(pwd)/.restore/uploads/smoke.sql"
+          resp=$(curl -sf -c /tmp/jar -b /tmp/jar -X POST \
+            'http://127.0.0.1:8080/restore-42.php?action=import_sql' \
+            -d "db_host=127.0.0.1&db_port=3306&db_user=testuser&db_pass=testpass&db_name=testdb&create_db=1&sql_file=${sql_path}")
+          echo "$resp"
+          echo "$resp" | grep -q '"ok":true'
+
+      - name: Verify — data in DB
+        run: |
+          result=$(mariadb -h127.0.0.1 -utestuser -ptestpass testdb \
+            -e "SELECT v FROM smoke WHERE id=1;" 2>/dev/null)
+          echo "$result"
+          echo "$result" | grep -q 'ok'
+
+      - name: Test — HTML page renders
+        run: |
+          resp=$(curl -sf http://127.0.0.1:8080/restore-42.php)
+          echo "$resp" | grep -q 'auth-screen'
+          echo "$resp" | grep -q '<script'
