@@ -1445,31 +1445,51 @@ async function uploadFile(file) {
 
   const started = Date.now();
   let bytesDone = 0;
+  let chunkStarted = Date.now();
+  let lastPct = 0;
+  let lastSpeed = 0;
+
+  // Ticker: update the ETA display every second even while a chunk is in-flight
+  const ticker = setInterval(() => {
+    const meta = document.getElementById(`${pbId}-meta`);
+    if (!meta) return;
+    const elapsed = (Date.now() - started) / 1000 || 0.001;
+    const chunkElapsed = (Date.now() - chunkStarted) / 1000;
+    const speed = bytesDone > 0 ? bytesDone / elapsed : 0;
+    const left = speed > 0 ? (file.size - bytesDone) / speed : null;
+    const stallNote = chunkElapsed > 10 ? ` · chunk ${fmtTime(chunkElapsed)}` : '';
+    meta.textContent = `${lastPct}% · ${fmtSize(speed)}/s${stallNote}` +
+      (left !== null ? ` · ${fmtTime(left)} left` : '');
+  }, 1000);
+
   uploadsInProgress++;
 
   try { for (let c = 0; c < chunks; c++) {
     if (cancelled) break;
     ctrl = new AbortController();
+    chunkStarted = Date.now();
     const fd = new FormData();
     fd.append('file', file.slice(c * CHUNK, (c+1) * CHUNK), file.name);
     fd.append('chunk', c); fd.append('chunks', chunks);
     let resp;
-    try { resp = await fetch(API('upload'), {method:'POST', body: fd, signal: ctrl.signal}); }
+    // 5-minute per-chunk timeout — surfaces stalls as a retryable error
+    const signal = AbortSignal.any
+      ? AbortSignal.any([ctrl.signal, AbortSignal.timeout(5 * 60 * 1000)])
+      : ctrl.signal;
+    try { resp = await fetch(API('upload'), {method:'POST', body: fd, signal}); }
     catch(e) {
-      if (!cancelled) { failed = true; failReason = e.message || 'Network error'; }
+      if (!cancelled) { failed = true; failReason = e.name === 'TimeoutError' ? 'Chunk timed out' : (e.message || 'Network error'); }
       break;
     }
     if (!resp.ok) { failed = true; failReason = `Server error ${resp.status}`; break; }
     bytesDone += Math.min(CHUNK, file.size - c * CHUNK);
-    const pct = Math.round((c + 1) / chunks * 100);
+    lastPct = Math.round((c + 1) / chunks * 100);
     const elapsed = (Date.now() - started) / 1000 || 0.001;
-    const speed = bytesDone / elapsed;
-    const left = (file.size - bytesDone) / speed;
+    lastSpeed = bytesDone / elapsed;
+    const left = (file.size - bytesDone) / lastSpeed;
     const pb = document.getElementById(pbId);
-    const meta = document.getElementById(`${pbId}-meta`);
-    if (pb) pb.style.width = pct + '%';
-    if (meta) meta.textContent = `${pct}% · ${fmtSize(speed)}/s · ${fmtTime(left)} left`;
-  } } finally { uploadsInProgress--; }
+    if (pb) pb.style.width = lastPct + '%';
+  } } finally { clearInterval(ticker); uploadsInProgress--; }
 
   document.getElementById(`${pbId}-cancel`)?.remove();
   const meta = document.getElementById(`${pbId}-meta`);
