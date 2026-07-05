@@ -8,10 +8,10 @@
 
 define('RESTORE_VERSION', '1.0.0');
 define('STORED_PASS_HASH', ''); // self-updated on first login — do not edit this line
-define('WORK_DIR', __DIR__ . '/restore_work');
+define('WORK_DIR', __DIR__ . '/.restore');
 define('UPLOADS_DIR', WORK_DIR . '/uploads');
 define('EXTRACT_DIR', WORK_DIR . '/extract');
-define('BACKUPS_DIR', __DIR__ . '/restore_backups');
+define('BACKUPS_DIR', WORK_DIR . '/backups');
 define('STATE_FILE', WORK_DIR . '/.state');
 
 error_reporting(E_ALL);
@@ -21,7 +21,7 @@ ini_set('memory_limit', '512M');
 
 session_start();
 
-foreach ([WORK_DIR, UPLOADS_DIR, EXTRACT_DIR] as $d) {
+foreach ([WORK_DIR, UPLOADS_DIR, EXTRACT_DIR, BACKUPS_DIR] as $d) {
     if (!is_dir($d)) {
         mkdir($d, 0755, true);
     }
@@ -95,6 +95,9 @@ switch ($action) {
         break;
     case 'delete_file':
         handleDeleteFile();
+        break;
+    case 'download_backup':
+        handleDownloadBackup();
         break;
     default:
         showHtml();
@@ -820,14 +823,6 @@ function handleBackup(): void
     $port    = (int)($_POST['db_port'] ?? 3306);
     $split   = (int)($_POST['split_mb'] ?? 100);
 
-    if (!is_dir(BACKUPS_DIR)) {
-        mkdir(BACKUPS_DIR, 0755, true);
-    }
-    $htb = BACKUPS_DIR . '/.htaccess';
-    if (!file_exists($htb)) {
-        file_put_contents($htb, 'Options -Indexes');
-    }
-
     $ts   = date('Ymd_His');
     $base = BACKUPS_DIR . '/backup_' . $ts;
     $res  = [];
@@ -854,7 +849,6 @@ function handleBackup(): void
     // 2. Files archive
     $archive = $base . '.tar.gz';
     $excludes = ' --exclude=' . escapeshellarg(basename(WORK_DIR))
-              . ' --exclude=' . escapeshellarg(basename(BACKUPS_DIR))
               . ' --exclude=' . escapeshellarg(basename(__FILE__));
     $tarCmd = "tar -czf " . escapeshellarg($archive) . $excludes .
               " -C " . escapeshellarg(dirname($rootDir)) . " " . escapeshellarg(basename($rootDir)) . " 2>&1";
@@ -946,6 +940,22 @@ function jsonErr(string $msg, int $code = 200): never
     header('Content-Type: application/json');
     http_response_code($code);
     echo json_encode(['ok' => false, 'error' => $msg]);
+    exit;
+}
+
+function handleDownloadBackup(): never
+{
+    $name = basename($_GET['file'] ?? '');
+    $path = BACKUPS_DIR . '/' . $name;
+    if (!$name || !file_exists($path) || !is_file($path)) {
+        http_response_code(404);
+        exit('Not found');
+    }
+    header('Content-Type: application/octet-stream');
+    header('Content-Disposition: attachment; filename="' . addslashes($name) . '"');
+    header('Content-Length: ' . filesize($path));
+    header('Cache-Control: no-cache');
+    readfile($path);
     exit;
 }
 
@@ -1241,7 +1251,7 @@ select option{background:#1a1d27}
           <div class="panel" style="text-align:center;padding:48px">
             <div style="font-size:48px;margin-bottom:16px">✅</div>
             <h2 style="margin-bottom:8px">Restore complete</h2>
-            <p style="color:#64748b;margin-bottom:24px">Check the site, then delete <code><?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?></code> and the <code>restore_work/</code> directory.</p>
+            <p style="color:#64748b;margin-bottom:24px">Check the site, then delete <code><?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?></code> and the <code>.restore/</code> directory.</p>
             <button class="btn btn-danger" onclick="if(confirm('Delete <?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?>?'))alert('Delete it manually — this tool cannot delete itself safely.')">Delete <?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?></button>
           </div>
         </div>
@@ -1626,7 +1636,7 @@ async function doBackup() {
       <div class="file-name">${f.name}</div>
       <div class="file-meta">${fmtSize(f.size)}</div>
      </div>
-     <a href="restore_backups/${f.name}" class="btn btn-secondary btn-sm" download>⬇️</a>
+     <a href="${API('download_backup')}&file=${encodeURIComponent(f.name)}" class="btn btn-secondary btn-sm" download>⬇️</a>
     </div>`
   ).join('');
 }

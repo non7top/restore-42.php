@@ -14,10 +14,10 @@ RUN echo '<Directory /var/www/html>\n    AllowOverride All\n    Require all gran
     && a2enconf allow-override
 
 # Pre-create writable directories so www-data can use them regardless of volume mount ownership
-RUN mkdir -p /var/www/html/restore_work/uploads \
-             /var/www/html/restore_work/extract \
-             /var/www/html/restore_backups \
-    && chown -R www-data:www-data /var/www/html/restore_work /var/www/html/restore_backups
+RUN mkdir -p /var/www/html/.restore/uploads \
+             /var/www/html/.restore/extract \
+             /var/www/html/.restore/backups \
+    && chown -R www-data:www-data /var/www/html/.restore
 
 # Entrypoint: fix ownership of volume-mounted dirs at startup, then run Apache
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh

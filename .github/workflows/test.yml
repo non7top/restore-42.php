@@ -41,7 +41,7 @@ jobs:
 
       - name: Start built-in PHP server
         run: |
-          mkdir -p restore_work/uploads restore_work/extract restore_backups
+          mkdir -p .restore/uploads .restore/extract .restore/backups
           php -S 127.0.0.1:8080 restore-42.php &
           sleep 1
 
@@ -87,7 +87,7 @@ jobs:
 
       - name: Test — import SQL
         run: |
-          sql_path="$(pwd)/restore_work/uploads/smoke.sql"
+          sql_path="$(pwd)/.restore/uploads/smoke.sql"
           resp=$(curl -sf -c /tmp/jar -b /tmp/jar -X POST \
             'http://127.0.0.1:8080/restore-42.php?action=import_sql' \
             -d "db_host=127.0.0.1&db_port=3306&db_user=testuser&db_pass=testpass&db_name=testdb&create_db=1&sql_file=${sql_path}")
