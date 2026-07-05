@@ -1,4 +1,5 @@
 <?php
+
 /**
  * restore-42.php — Universal PHP Restore Tool
  * Single-file, Bitrix-compatible format
@@ -21,13 +22,19 @@ ini_set('memory_limit', '512M');
 session_start();
 
 foreach ([WORK_DIR, UPLOADS_DIR, EXTRACT_DIR] as $d) {
-    if (!is_dir($d)) mkdir($d, 0755, true);
+    if (!is_dir($d)) {
+        mkdir($d, 0755, true);
+    }
 }
 // Protect work dir from direct web access
 $htFile = WORK_DIR . '/.htaccess';
-if (!file_exists($htFile)) file_put_contents($htFile, 'Deny from all');
+if (!file_exists($htFile)) {
+    file_put_contents($htFile, 'Deny from all');
+}
 // Clean up orphaned chunk files left by interrupted uploads
-foreach (glob(UPLOADS_DIR . '/*.chunk*') ?: [] as $orphan) { unlink($orphan); }
+foreach (glob(UPLOADS_DIR . '/*.chunk*') ?: [] as $orphan) {
+    unlink($orphan);
+}
 
 // ── Router ────────────────────────────────────────────────────────────────────
 
@@ -38,41 +45,86 @@ if ($action && !in_array($action, ['login', 'check_auth'], true)) {
 }
 
 switch ($action) {
-    case 'login':          handleLogin(); break;
-    case 'logout':         handleLogout(); break;
-    case 'check_auth':     jsonOk(['auth' => isAuth()]); break;
-    case 'upload':         handleUpload(); break;
-    case 'list_files':     handleListFiles(); break;
-    case 'join_parts':     handleJoinParts(); break;
-    case 'extract':        handleExtract(); break;
-    case 'scan':           handleScan(); break;
-    case 'test_db':        handleTestDb(); break;
-    case 'import_sql':     handleImportSql(); break;
-    case 'update_config':  handleUpdateConfig(); break;
-    case 'clear_cache':    handleClearCache(); break;
-    case 'htaccess':       handleHtaccess(); break;
-    case 'backup':         handleBackup(); break;
-    case 'get_state':      jsonOk(getState()); break;
-    case 'set_state':      handleSetState(); break;
-    case 'delete_file':    handleDeleteFile(); break;
-    default:               showHtml(); break;
+    case 'login':
+        handleLogin();
+        break;
+    case 'logout':
+        handleLogout();
+        break;
+    case 'check_auth':
+        jsonOk(['auth' => isAuth()]);
+        break;
+    case 'upload':
+        handleUpload();
+        break;
+    case 'list_files':
+        handleListFiles();
+        break;
+    case 'join_parts':
+        handleJoinParts();
+        break;
+    case 'extract':
+        handleExtract();
+        break;
+    case 'scan':
+        handleScan();
+        break;
+    case 'test_db':
+        handleTestDb();
+        break;
+    case 'import_sql':
+        handleImportSql();
+        break;
+    case 'update_config':
+        handleUpdateConfig();
+        break;
+    case 'clear_cache':
+        handleClearCache();
+        break;
+    case 'htaccess':
+        handleHtaccess();
+        break;
+    case 'backup':
+        handleBackup();
+        break;
+    case 'get_state':
+        jsonOk(getState());
+        break;
+    case 'set_state':
+        handleSetState();
+        break;
+    case 'delete_file':
+        handleDeleteFile();
+        break;
+    default:
+        showHtml();
+        break;
 }
 
 // ── Auth ─────────────────────────────────────────────────────────────────────
 
-function isAuth(): bool { return !empty($_SESSION['ra']); }
-
-function requireAuth(): void {
-    if (!isAuth()) jsonErr('Not authenticated', 401);
+function isAuth(): bool
+{
+    return !empty($_SESSION['ra']);
 }
 
-function handleLogin(): void {
+function requireAuth(): void
+{
+    if (!isAuth()) {
+        jsonErr('Not authenticated', 401);
+    }
+}
+
+function handleLogin(): void
+{
     $pw   = trim($_POST['password'] ?? '');
     $hash = STORED_PASS_HASH;
 
     if ($hash === '') {
         // First run: embed hash into own source
-        if (strlen($pw) < 6) jsonErr('Password must be at least 6 characters');
+        if (strlen($pw) < 6) {
+            jsonErr('Password must be at least 6 characters');
+        }
         $newHash = password_hash($pw, PASSWORD_BCRYPT);
         $written = selfEmbedHash($newHash);
         $_SESSION['ra'] = true;
@@ -87,7 +139,8 @@ function handleLogin(): void {
     jsonErr('Invalid password');
 }
 
-function selfEmbedHash(string $hash): bool {
+function selfEmbedHash(string $hash): bool
+{
     $file   = __FILE__;
     $source = file_get_contents($file);
     $count  = 0;
@@ -101,26 +154,39 @@ function selfEmbedHash(string $hash): bool {
         $source,
         1
     );
-    if (!$count || $updated === null) return false;
-    if (!is_writable($file)) return false;
+    if (!$count || $updated === null) {
+        return false;
+    }
+    if (!is_writable($file)) {
+        return false;
+    }
     return file_put_contents($file, $updated) !== false;
 }
 
-function handleLogout(): void { session_destroy(); jsonOk(); }
+function handleLogout(): void
+{
+    session_destroy();
+    jsonOk();
+}
 
 // ── State ────────────────────────────────────────────────────────────────────
 
-function getState(): array {
-    if (!file_exists(STATE_FILE)) return [];
+function getState(): array
+{
+    if (!file_exists(STATE_FILE)) {
+        return [];
+    }
     $d = json_decode(file_get_contents(STATE_FILE), true);
     return is_array($d) ? $d : [];
 }
 
-function saveState(array $s): void {
+function saveState(array $s): void
+{
     file_put_contents(STATE_FILE, json_encode($s, JSON_PRETTY_PRINT));
 }
 
-function handleSetState(): void {
+function handleSetState(): void
+{
     $in = json_decode(file_get_contents('php://input'), true) ?? [];
     $s = array_merge(getState(), $in);
     saveState($s);
@@ -129,8 +195,11 @@ function handleSetState(): void {
 
 // ── Upload ────────────────────────────────────────────────────────────────────
 
-function handleUpload(): void {
-    if (empty($_FILES['file'])) jsonErr('No file');
+function handleUpload(): void
+{
+    if (empty($_FILES['file'])) {
+        jsonErr('No file');
+    }
     $f = $_FILES['file'];
     // Strip only chars unsafe on common filesystems; preserve UTF-8 (Cyrillic, CJK, etc.)
     $name = preg_replace('/[\x00-\x1f\/\\\\:*?"<>|]/', '_', basename($f['name']));
@@ -159,114 +228,163 @@ function handleUpload(): void {
     jsonOk(['file' => $name, 'size' => filesize($dest), 'done' => true]);
 }
 
-function handleListFiles(): void {
+function handleListFiles(): void
+{
     $files = [];
     foreach (glob(UPLOADS_DIR . '/*') as $f) {
-        if (!is_file($f)) continue;
+        if (!is_file($f)) {
+            continue;
+        }
         $files[] = ['name' => basename($f), 'size' => filesize($f), 'type' => detectUploadType($f)];
     }
     jsonOk(['files' => $files]);
 }
 
-function handleDeleteFile(): void {
+function handleDeleteFile(): void
+{
     $name = basename($_POST['file'] ?? '');
     $path = UPLOADS_DIR . '/' . $name;
-    if (file_exists($path)) unlink($path);
+    if (file_exists($path)) {
+        unlink($path);
+    }
     jsonOk();
 }
 
-function detectUploadType(string $path): string {
+function detectUploadType(string $path): string
+{
     $n = strtolower(basename($path));
-    if (preg_match('/\.sql(\.gz)?$/', $n)) return 'sql';
-    if (preg_match('/\.(tar\.gz|tgz|zip|tar)$/', $n)) return 'archive';
+    if (preg_match('/\.sql(\.gz)?$/', $n)) {
+        return 'sql';
+    }
+    if (preg_match('/\.(tar\.gz|tgz|zip|tar)$/', $n)) {
+        return 'archive';
+    }
     // Bitrix parts: archive.tar.1, archive.tar.2 or legacy .001
-    if (preg_match('/\.\d+$/', $n)) return 'part';
+    if (preg_match('/\.\d+$/', $n)) {
+        return 'part';
+    }
     return 'unknown';
 }
 
 // ── Join split parts ─────────────────────────────────────────────────────────
 
-function handleJoinParts(): void {
+function handleJoinParts(): void
+{
     $base = $_POST['basename'] ?? '';
-    if (!$base) jsonErr('No basename');
+    if (!$base) {
+        jsonErr('No basename');
+    }
     $parts = [];
     foreach (glob(UPLOADS_DIR . '/*') as $f) {
         // Bitrix style: archive.tar.1, archive.tar.2 or classic .001, .002
-        if (preg_match('/^' . preg_quote($base, '/') . '\.\d+$/', basename($f))) $parts[] = $f;
+        if (preg_match('/^' . preg_quote($base, '/') . '\.\d+$/', basename($f))) {
+            $parts[] = $f;
+        }
     }
     // Natural sort so .1 < .2 < ... < .10 (not lexicographic)
     natsort($parts);
-    if (!$parts) jsonErr('No parts found');
+    if (!$parts) {
+        jsonErr('No parts found');
+    }
     $out = UPLOADS_DIR . '/' . $base;
     $fp = fopen($out, 'wb');
-    foreach ($parts as $p) { fwrite($fp, file_get_contents($p)); unlink($p); }
+    foreach ($parts as $p) {
+        fwrite($fp, file_get_contents($p));
+        unlink($p);
+    }
     fclose($fp);
     jsonOk(['file' => $base, 'parts' => count($parts)]);
 }
 
 // ── Extract ───────────────────────────────────────────────────────────────────
 
-function handleExtract(): void {
+function handleExtract(): void
+{
     $name = basename($_POST['file'] ?? '');
     $src  = UPLOADS_DIR . '/' . $name;
-    if (!file_exists($src)) jsonErr('File not found');
+    if (!file_exists($src)) {
+        jsonErr('File not found');
+    }
 
     rmdirRecursive(EXTRACT_DIR);
     mkdir(EXTRACT_DIR, 0755, true);
 
     $n = strtolower($name);
-    if (preg_match('/\.zip$/', $n))          $r = extractZip($src, EXTRACT_DIR);
-    elseif (preg_match('/\.(tar\.gz|tgz)$/', $n)) $r = extractTarGz($src, EXTRACT_DIR);
-    elseif (preg_match('/\.tar$/', $n))       $r = extractTar($src, EXTRACT_DIR);
-    else jsonErr('Unsupported format');
+    if (preg_match('/\.zip$/', $n)) {
+        $r = extractZip($src, EXTRACT_DIR);
+    } elseif (preg_match('/\.(tar\.gz|tgz)$/', $n)) {
+        $r = extractTarGz($src, EXTRACT_DIR);
+    } elseif (preg_match('/\.tar$/', $n)) {
+        $r = extractTar($src, EXTRACT_DIR);
+    } else {
+        jsonErr('Unsupported format');
+    }
 
-    if (!$r['ok']) jsonErr($r['err']);
+    if (!$r['ok']) {
+        jsonErr($r['err']);
+    }
 
     $nested = singleNestedDir(EXTRACT_DIR);
     jsonOk(['nested' => $nested, 'files' => countFiles(EXTRACT_DIR)]);
 }
 
-function extractZip(string $src, string $dst): array {
+function extractZip(string $src, string $dst): array
+{
     if (class_exists('ZipArchive')) {
         $z = new ZipArchive();
-        if ($z->open($src) !== true) return ['ok' => false, 'err' => 'Cannot open ZIP'];
-        $z->extractTo($dst); $z->close();
+        if ($z->open($src) !== true) {
+            return ['ok' => false, 'err' => 'Cannot open ZIP'];
+        }
+        $z->extractTo($dst);
+        $z->close();
         return ['ok' => true];
     }
     exec('unzip ' . escapeshellarg($src) . ' -d ' . escapeshellarg($dst) . ' 2>&1', $o, $c);
     return $c === 0 ? ['ok' => true] : ['ok' => false, 'err' => implode("\n", $o)];
 }
 
-function extractTarGz(string $src, string $dst): array {
+function extractTarGz(string $src, string $dst): array
+{
     exec('tar -xzf ' . escapeshellarg($src) . ' -C ' . escapeshellarg($dst) . ' 2>&1', $o, $c);
-    if ($c === 0) return ['ok' => true];
+    if ($c === 0) {
+        return ['ok' => true];
+    }
     // Try PharData
     try {
         (new PharData($src))->extractTo($dst, null, true);
         return ['ok' => true];
-    } catch (Throwable $e) {}
+    } catch (Throwable $e) {
+    }
     return ['ok' => false, 'err' => implode("\n", $o)];
 }
 
-function extractTar(string $src, string $dst): array {
+function extractTar(string $src, string $dst): array
+{
     exec('tar -xf ' . escapeshellarg($src) . ' -C ' . escapeshellarg($dst) . ' 2>&1', $o, $c);
-    if ($c === 0) return ['ok' => true];
+    if ($c === 0) {
+        return ['ok' => true];
+    }
     try {
         (new PharData($src))->extractTo($dst, null, true);
         return ['ok' => true];
-    } catch (Throwable $e) {}
+    } catch (Throwable $e) {
+    }
     return ['ok' => false, 'err' => implode("\n", $o)];
 }
 
-function singleNestedDir(string $dir): ?string {
+function singleNestedDir(string $dir): ?string
+{
     $entries = array_values(array_diff(scandir($dir), ['.', '..']));
-    if (count($entries) === 1 && is_dir($dir . '/' . $entries[0])) return $entries[0];
+    if (count($entries) === 1 && is_dir($dir . '/' . $entries[0])) {
+        return $entries[0];
+    }
     return null;
 }
 
 // ── Scan extracted dir ────────────────────────────────────────────────────────
 
-function handleScan(): void {
+function handleScan(): void
+{
     $nested = singleNestedDir(EXTRACT_DIR);
     $root   = $nested ? EXTRACT_DIR . '/' . $nested : EXTRACT_DIR;
     $fw     = detectFramework($root);
@@ -276,23 +394,37 @@ function handleScan(): void {
 
 // ── Framework detection ───────────────────────────────────────────────────────
 
-function detectFramework(string $dir): string {
-    if (is_dir($dir . '/bitrix') && file_exists($dir . '/bitrix/modules/main/include.php')) return 'bitrix';
-    if (file_exists($dir . '/wp-config.php') || file_exists($dir . '/wp-includes/version.php')) return 'wordpress';
-    if (file_exists($dir . '/core/config/config.inc.php') || file_exists($dir . '/manager/includes/config.inc.php')) return 'modx';
-    if (is_dir($dir . '/wa-system') || (is_dir($dir . '/wa-apps') && is_dir($dir . '/wa-config'))) return 'webasyst';
+function detectFramework(string $dir): string
+{
+    if (is_dir($dir . '/bitrix') && file_exists($dir . '/bitrix/modules/main/include.php')) {
+        return 'bitrix';
+    }
+    if (file_exists($dir . '/wp-config.php') || file_exists($dir . '/wp-includes/version.php')) {
+        return 'wordpress';
+    }
+    if (file_exists($dir . '/core/config/config.inc.php') || file_exists($dir . '/manager/includes/config.inc.php')) {
+        return 'modx';
+    }
+    if (is_dir($dir . '/wa-system') || (is_dir($dir . '/wa-apps') && is_dir($dir . '/wa-config'))) {
+        return 'webasyst';
+    }
     return 'unknown';
 }
 
 // ── SQL heuristics ────────────────────────────────────────────────────────────
 
-function findSqlFiles(string $base): array {
+function findSqlFiles(string $base): array
+{
     $files = [];
     $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($base, FilesystemIterator::SKIP_DOTS));
     foreach ($it as $f) {
-        if (!$f->isFile()) continue;
+        if (!$f->isFile()) {
+            continue;
+        }
         $n = strtolower($f->getFilename());
-        if (!preg_match('/\.sql(\.gz)?$/', $n)) continue;
+        if (!preg_match('/\.sql(\.gz)?$/', $n)) {
+            continue;
+        }
         $score = sqlScore($f->getPathname(), $f->getFilename());
         $files[] = ['path' => $f->getPathname(), 'name' => $f->getFilename(), 'size' => $f->getSize(), 'score' => $score, 'is_dump' => $score > 50];
     }
@@ -300,53 +432,96 @@ function findSqlFiles(string $base): array {
     return $files;
 }
 
-function sqlScore(string $path, string $name): int {
+function sqlScore(string $path, string $name): int
+{
     $n = strtolower($name);
     $s = 0;
-    if (str_contains($n, 'dump'))   $s += 30;
-    if (str_contains($n, 'backup')) $s += 25;
-    if (str_contains($n, 'export')) $s += 20;
-    if (preg_match('/\d{8}/', $n))  $s += 15;
-    if (str_contains($n, 'migrat')) $s -= 50;
-    if (str_contains($n, 'schema')) $s -= 20;
-    if (str_contains($n, 'seed'))   $s -= 30;
-    if (preg_match('/^\d{4}_/', $n)) $s -= 40;
+    if (str_contains($n, 'dump')) {
+        $s += 30;
+    }
+    if (str_contains($n, 'backup')) {
+        $s += 25;
+    }
+    if (str_contains($n, 'export')) {
+        $s += 20;
+    }
+    if (preg_match('/\d{8}/', $n)) {
+        $s += 15;
+    }
+    if (str_contains($n, 'migrat')) {
+        $s -= 50;
+    }
+    if (str_contains($n, 'schema')) {
+        $s -= 20;
+    }
+    if (str_contains($n, 'seed')) {
+        $s -= 30;
+    }
+    if (preg_match('/^\d{4}_/', $n)) {
+        $s -= 40;
+    }
 
     $gz = str_ends_with(strtolower($path), '.gz');
     $h  = '';
     if ($gz) {
         $g = @gzopen($path, 'r');
-        if ($g) { $h = gzread($g, 4096); gzclose($g); }
+        if ($g) {
+            $h = gzread($g, 4096);
+            gzclose($g);
+        }
     } else {
         $fp = @fopen($path, 'r');
-        if ($fp) { $h = fread($fp, 4096); fclose($fp); }
+        if ($fp) {
+            $h = fread($fp, 4096);
+            fclose($fp);
+        }
     }
 
-    if (str_contains($h, 'CREATE TABLE'))     $s += 40;
-    if (str_contains($h, 'INSERT INTO'))      $s += 20;
-    if (str_contains($h, 'mysqldump'))        $s += 30;
-    if (str_contains($h, 'MySQL dump'))       $s += 30;
-    if (preg_match('/-- Host:/', $h))         $s += 20;
+    if (str_contains($h, 'CREATE TABLE')) {
+        $s += 40;
+    }
+    if (str_contains($h, 'INSERT INTO')) {
+        $s += 20;
+    }
+    if (str_contains($h, 'mysqldump')) {
+        $s += 30;
+    }
+    if (str_contains($h, 'MySQL dump')) {
+        $s += 30;
+    }
+    if (preg_match('/-- Host:/', $h)) {
+        $s += 20;
+    }
     return $s;
 }
 
 // ── Database ──────────────────────────────────────────────────────────────────
 
-function dbConnect(string $host, string $user, string $pass, int $port, string $db = ''): PDO {
+function dbConnect(string $host, string $user, string $pass, int $port, string $db = ''): PDO
+{
     $dsn = "mysql:host={$host};port={$port};charset=utf8mb4" . ($db ? ";dbname={$db}" : '');
     return new PDO($dsn, $user, $pass, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_TIMEOUT => 5]);
 }
 
-function handleTestDb(): void {
+function handleTestDb(): void
+{
     try {
-        $pdo = dbConnect($_POST['db_host'] ?? 'localhost', $_POST['db_user'] ?? '',
-            $_POST['db_pass'] ?? '', (int)($_POST['db_port'] ?? 3306), $_POST['db_name'] ?? '');
+        $pdo = dbConnect(
+            $_POST['db_host'] ?? 'localhost',
+            $_POST['db_user'] ?? '',
+            $_POST['db_pass'] ?? '',
+            (int)($_POST['db_port'] ?? 3306),
+            $_POST['db_name'] ?? ''
+        );
         $ver = $pdo->query('SELECT VERSION()')->fetchColumn();
         jsonOk(['version' => $ver]);
-    } catch (Throwable $e) { jsonErr($e->getMessage()); }
+    } catch (Throwable $e) {
+        jsonErr($e->getMessage());
+    }
 }
 
-function handleImportSql(): void {
+function handleImportSql(): void
+{
     $sqlFile = $_POST['sql_file'] ?? '';
     $real    = realpath($sqlFile);
     $workReal = realpath(WORK_DIR);
@@ -368,8 +543,12 @@ function handleImportSql(): void {
         if (!empty($_POST['create_db']) && $db) {
             $pdo->exec("CREATE DATABASE IF NOT EXISTS `{$db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
         }
-        if ($db) $pdo->exec("USE `{$db}`");
-    } catch (Throwable $e) { jsonErr('DB connect: ' . $e->getMessage()); }
+        if ($db) {
+            $pdo->exec("USE `{$db}`");
+        }
+    } catch (Throwable $e) {
+        jsonErr('DB connect: ' . $e->getMessage());
+    }
 
     // Try mysql CLI first
     $mysqlBin = trim(shell_exec('which mysql 2>/dev/null') ?: '');
@@ -382,7 +561,9 @@ function handleImportSql(): void {
                ($gz   ? '' : " < " . escapeshellarg($real)) .
                " 2>&1";
         exec($cmd, $out, $ret);
-        if ($ret === 0) jsonOk(['method' => 'cli']);
+        if ($ret === 0) {
+            jsonOk(['method' => 'cli']);
+        }
         // Fall through to PDO on failure
     }
 
@@ -391,25 +572,42 @@ function handleImportSql(): void {
     jsonOk(['method' => 'pdo']);
 }
 
-function importViaPdo(PDO $pdo, string $file): void {
+function importViaPdo(PDO $pdo, string $file): void
+{
     $gz   = str_ends_with(strtolower($file), '.gz');
     $fh   = $gz ? gzopen($file, 'r') : fopen($file, 'r');
-    if (!$fh) throw new RuntimeException('Cannot open SQL file');
+    if (!$fh) {
+        throw new RuntimeException('Cannot open SQL file');
+    }
 
-    $buf = ''; $delim = ';';
+    $buf = '';
+    $delim = ';';
     $eof = fn() => $gz ? gzeof($fh) : feof($fh);
     $rd  = fn() => $gz ? gzgets($fh, 65536) : fgets($fh, 65536);
 
     while (!$eof()) {
         $line = $rd();
-        if ($line === false) break;
+        if ($line === false) {
+            break;
+        }
         $t = ltrim($line);
-        if ($t === '' || str_starts_with($t, '--') || str_starts_with($t, '/*')) continue;
-        if (preg_match('/^DELIMITER\s+(.+)$/i', trim($line), $m)) { $delim = trim($m[1]); continue; }
+        if ($t === '' || str_starts_with($t, '--') || str_starts_with($t, '/*')) {
+            continue;
+        }
+        if (preg_match('/^DELIMITER\s+(.+)$/i', trim($line), $m)) {
+            $delim = trim($m[1]);
+            continue;
+        }
         $buf .= $line;
         if (str_ends_with(rtrim($buf), $delim)) {
             $q = trim(substr($buf, 0, -strlen($delim)));
-            if ($q) { try { $pdo->exec($q); } catch (Throwable $e) { error_log('SQL: ' . $e->getMessage()); } }
+            if ($q) {
+                try {
+                    $pdo->exec($q);
+                } catch (Throwable $e) {
+                    error_log('SQL: ' . $e->getMessage());
+                }
+            }
             $buf = '';
         }
     }
@@ -418,10 +616,13 @@ function importViaPdo(PDO $pdo, string $file): void {
 
 // ── Framework config update ───────────────────────────────────────────────────
 
-function handleUpdateConfig(): void {
+function handleUpdateConfig(): void
+{
     $fw      = $_POST['framework'] ?? '';
     $rootDir = realpath($_POST['root_dir'] ?? '');
-    if (!$rootDir) jsonErr('Directory not found');
+    if (!$rootDir) {
+        jsonErr('Directory not found');
+    }
 
     $cfg = [
         'host' => $_POST['db_host'] ?? 'localhost',
@@ -432,7 +633,7 @@ function handleUpdateConfig(): void {
         'url'  => rtrim($_POST['site_url'] ?? '', '/'),
     ];
 
-    $res = match($fw) {
+    $res = match ($fw) {
         'bitrix'    => cfgBitrix($rootDir, $cfg),
         'wordpress' => cfgWordPress($rootDir, $cfg),
         'modx'      => cfgModx($rootDir, $cfg),
@@ -442,13 +643,14 @@ function handleUpdateConfig(): void {
     jsonOk(['results' => $res]);
 }
 
-function cfgBitrix(string $dir, array $c): array {
+function cfgBitrix(string $dir, array $c): array
+{
     $res = [];
     $f   = $dir . '/bitrix/.settings.php';
     if (file_exists($f)) {
         $s = file_get_contents($f);
-        $s = preg_replace("/'host'\s*=>\s*'[^']*'/",     "'host' => '{$c['host']}'", $s);
-        $s = preg_replace("/'login'\s*=>\s*'[^']*'/",    "'login' => '{$c['user']}'", $s);
+        $s = preg_replace("/'host'\s*=>\s*'[^']*'/", "'host' => '{$c['host']}'", $s);
+        $s = preg_replace("/'login'\s*=>\s*'[^']*'/", "'login' => '{$c['user']}'", $s);
         $s = preg_replace("/'password'\s*=>\s*'[^']*'/", "'password' => '{$c['pass']}'", $s);
         $s = preg_replace("/'database'\s*=>\s*'[^']*'/", "'database' => '{$c['db']}'", $s);
         file_put_contents($f, $s);
@@ -457,51 +659,67 @@ function cfgBitrix(string $dir, array $c): array {
     $f2 = $dir . '/bitrix/php_interface/dbconn.php';
     if (file_exists($f2)) {
         $s = file_get_contents($f2);
-        $s = preg_replace('/\$DBHost\s*=\s*"[^"]*"/',     "\$DBHost = \"{$c['host']}\"", $s);
-        $s = preg_replace('/\$DBLogin\s*=\s*"[^"]*"/',    "\$DBLogin = \"{$c['user']}\"", $s);
+        $s = preg_replace('/\$DBHost\s*=\s*"[^"]*"/', "\$DBHost = \"{$c['host']}\"", $s);
+        $s = preg_replace('/\$DBLogin\s*=\s*"[^"]*"/', "\$DBLogin = \"{$c['user']}\"", $s);
         $s = preg_replace('/\$DBPassword\s*=\s*"[^"]*"/', "\$DBPassword = \"{$c['pass']}\"", $s);
-        $s = preg_replace('/\$DBName\s*=\s*"[^"]*"/',     "\$DBName = \"{$c['db']}\"", $s);
+        $s = preg_replace('/\$DBName\s*=\s*"[^"]*"/', "\$DBName = \"{$c['db']}\"", $s);
         file_put_contents($f2, $s);
         $res[] = "Updated dbconn.php";
     }
-    if (!$res) $res[] = 'No Bitrix config files found';
+    if (!$res) {
+        $res[] = 'No Bitrix config files found';
+    }
     return $res;
 }
 
-function cfgWordPress(string $dir, array $c): array {
+function cfgWordPress(string $dir, array $c): array
+{
     $f = $dir . '/wp-config.php';
-    if (!file_exists($f)) return ['wp-config.php not found'];
+    if (!file_exists($f)) {
+        return ['wp-config.php not found'];
+    }
     $s = file_get_contents($f);
     $map = ['DB_HOST' => $c['host'], 'DB_USER' => $c['user'], 'DB_PASSWORD' => $c['pass'], 'DB_NAME' => $c['db']];
     foreach ($map as $k => $v) {
-        $s = preg_replace("/define\s*\(\s*['\"]" . $k . "['\"]\s*,\s*['\"][^'\"]*['\"]\s*\)/",
-            "define('{$k}', '{$v}')", $s);
+        $s = preg_replace(
+            "/define\s*\(\s*['\"]" . $k . "['\"]\s*,\s*['\"][^'\"]*['\"]\s*\)/",
+            "define('{$k}', '{$v}')",
+            $s
+        );
     }
     if ($c['url']) {
         foreach (['WP_SITEURL', 'WP_HOME'] as $k) {
             if (str_contains($s, $k)) {
-                $s = preg_replace("/define\s*\(\s*['\"]" . $k . "['\"]\s*,\s*['\"][^'\"]*['\"]\s*\)/",
-                    "define('{$k}', '{$c['url']}')", $s);
+                $s = preg_replace(
+                    "/define\s*\(\s*['\"]" . $k . "['\"]\s*,\s*['\"][^'\"]*['\"]\s*\)/",
+                    "define('{$k}', '{$c['url']}')",
+                    $s
+                );
             }
         }
     }
     file_put_contents($f, $s);
     $res = ['Updated wp-config.php'];
-    if ($c['url']) $res[] = 'Also run: UPDATE wp_options SET option_value="' . $c['url'] . '" WHERE option_name IN ("siteurl","home")';
+    if ($c['url']) {
+        $res[] = 'Also run: UPDATE wp_options SET option_value="' . $c['url'] . '" WHERE option_name IN ("siteurl","home")';
+    }
     return $res;
 }
 
-function cfgModx(string $dir, array $c): array {
+function cfgModx(string $dir, array $c): array
+{
     $f = file_exists($dir . '/core/config/config.inc.php')
        ? $dir . '/core/config/config.inc.php'
        : $dir . '/manager/includes/config.inc.php';
-    if (!file_exists($f)) return ['MODX config not found'];
+    if (!file_exists($f)) {
+        return ['MODX config not found'];
+    }
     $s = file_get_contents($f);
-    $s = preg_replace("/\\\$database_server\s*=\s*'[^']*'/",  "\$database_server = '{$c['host']}'", $s);
-    $s = preg_replace("/\\\$database_user\s*=\s*'[^']*'/",    "\$database_user = '{$c['user']}'", $s);
-    $s = preg_replace("/\\\$database_password\s*=\s*'[^']*'/","\$database_password = '{$c['pass']}'", $s);
-    $s = preg_replace("/\\\$dbase\s*=\s*'[^']*'/",            "\$dbase = '{$c['db']}'", $s);
-    $s = preg_replace("/\\\$database_name\s*=\s*'[^']*'/",    "\$database_name = '{$c['db']}'", $s);
+    $s = preg_replace("/\\\$database_server\s*=\s*'[^']*'/", "\$database_server = '{$c['host']}'", $s);
+    $s = preg_replace("/\\\$database_user\s*=\s*'[^']*'/", "\$database_user = '{$c['user']}'", $s);
+    $s = preg_replace("/\\\$database_password\s*=\s*'[^']*'/", "\$database_password = '{$c['pass']}'", $s);
+    $s = preg_replace("/\\\$dbase\s*=\s*'[^']*'/", "\$dbase = '{$c['db']}'", $s);
+    $s = preg_replace("/\\\$database_name\s*=\s*'[^']*'/", "\$database_name = '{$c['db']}'", $s);
     if ($c['url']) {
         $s = preg_replace("/\\\$site_url\s*=\s*'[^']*'/", "\$site_url = '{$c['url']}/'", $s);
         $s = preg_replace("/\\\$base_path\s*=\s*'[^']*'/", "\$base_path = '{$dir}/'", $s);
@@ -510,13 +728,14 @@ function cfgModx(string $dir, array $c): array {
     return ['Updated ' . basename($f)];
 }
 
-function cfgWebasyst(string $dir, array $c): array {
+function cfgWebasyst(string $dir, array $c): array
+{
     $res = [];
     $f = $dir . '/wa-config/db.php';
     if (file_exists($f)) {
         $s = file_get_contents($f);
-        $s = preg_replace("/'host'\s*=>\s*'[^']*'/",     "'host' => '{$c['host']}'", $s);
-        $s = preg_replace("/'user'\s*=>\s*'[^']*'/",     "'user' => '{$c['user']}'", $s);
+        $s = preg_replace("/'host'\s*=>\s*'[^']*'/", "'host' => '{$c['host']}'", $s);
+        $s = preg_replace("/'user'\s*=>\s*'[^']*'/", "'user' => '{$c['user']}'", $s);
         $s = preg_replace("/'password'\s*=>\s*'[^']*'/", "'password' => '{$c['pass']}'", $s);
         $s = preg_replace("/'database'\s*=>\s*'[^']*'/", "'database' => '{$c['db']}'", $s);
         file_put_contents($f, $s);
@@ -536,12 +755,15 @@ function cfgWebasyst(string $dir, array $c): array {
 
 // ── Cache clearing ────────────────────────────────────────────────────────────
 
-function handleClearCache(): void {
+function handleClearCache(): void
+{
     $fw  = $_POST['framework'] ?? '';
     $dir = realpath($_POST['root_dir'] ?? '');
-    if (!$dir) jsonErr('Directory not found');
+    if (!$dir) {
+        jsonErr('Directory not found');
+    }
 
-    $dirs = match($fw) {
+    $dirs = match ($fw) {
         'bitrix'    => [$dir . '/bitrix/cache', $dir . '/bitrix/managed_cache', $dir . '/bitrix/stack_cache'],
         'wordpress' => [$dir . '/wp-content/cache'],
         'modx'      => [$dir . '/core/cache', $dir . '/assets/cache'],
@@ -551,22 +773,30 @@ function handleClearCache(): void {
 
     $cleared = [];
     foreach ($dirs as $d) {
-        if (is_dir($d)) { clearDir($d); $cleared[] = $d; }
+        if (is_dir($d)) {
+            clearDir($d);
+            $cleared[] = $d;
+        }
     }
     jsonOk(['cleared' => $cleared]);
 }
 
 // ── .htaccess ─────────────────────────────────────────────────────────────────
 
-function handleHtaccess(): void {
+function handleHtaccess(): void
+{
     $fw  = $_POST['framework'] ?? '';
     $dir = realpath($_POST['root_dir'] ?? '');
-    if (!$dir) jsonErr('Directory not found');
+    if (!$dir) {
+        jsonErr('Directory not found');
+    }
 
     $f = $dir . '/.htaccess';
-    if (file_exists($f)) rename($f, $f . '.bak');
+    if (file_exists($f)) {
+        rename($f, $f . '.bak');
+    }
 
-    $tpl = match($fw) {
+    $tpl = match ($fw) {
         'wordpress' => "# BEGIN WordPress\n<IfModule mod_rewrite.c>\nRewriteEngine On\nRewriteBase /\nRewriteRule ^index\\.php$ - [L]\nRewriteCond %{REQUEST_FILENAME} !-f\nRewriteCond %{REQUEST_FILENAME} !-d\nRewriteRule . /index.php [L]\n</IfModule>\n# END WordPress\n",
         'bitrix'    => "Options -Indexes\n<IfModule mod_rewrite.c>\nRewriteEngine On\nRewriteCond %{REQUEST_FILENAME} !-f\nRewriteCond %{REQUEST_FILENAME} !-d\nRewriteRule ^ /bitrix/urlrewrite.php [L]\n</IfModule>\n",
         'modx'      => "<IfModule mod_rewrite.c>\nRewriteEngine On\nRewriteBase /\nRewriteCond %{REQUEST_FILENAME} !-f\nRewriteCond %{REQUEST_FILENAME} !-d\nRewriteRule ^(.*)$ index.php?q=$1 [L,QSA]\n</IfModule>\n",
@@ -580,7 +810,8 @@ function handleHtaccess(): void {
 
 // ── Backup (reverse mode) ─────────────────────────────────────────────────────
 
-function handleBackup(): void {
+function handleBackup(): void
+{
     $rootDir = realpath($_POST['root_dir'] ?? __DIR__);
     $host    = $_POST['db_host'] ?? 'localhost';
     $user    = $_POST['db_user'] ?? '';
@@ -589,9 +820,13 @@ function handleBackup(): void {
     $port    = (int)($_POST['db_port'] ?? 3306);
     $split   = (int)($_POST['split_mb'] ?? 100);
 
-    if (!is_dir(BACKUPS_DIR)) mkdir(BACKUPS_DIR, 0755, true);
+    if (!is_dir(BACKUPS_DIR)) {
+        mkdir(BACKUPS_DIR, 0755, true);
+    }
     $htb = BACKUPS_DIR . '/.htaccess';
-    if (!file_exists($htb)) file_put_contents($htb, 'Options -Indexes');
+    if (!file_exists($htb)) {
+        file_put_contents($htb, 'Options -Indexes');
+    }
 
     $ts   = date('Ymd_His');
     $base = BACKUPS_DIR . '/backup_' . $ts;
@@ -606,8 +841,11 @@ function handleBackup(): void {
                    ($pass ? " -p" . escapeshellarg($pass) : '') . " " . escapeshellarg($db) .
                    " > " . escapeshellarg($sqlFile) . " 2>&1";
             exec($cmd, $o, $ret);
-            if ($ret === 0) $res[] = "SQL dump: backup_{$ts}.sql";
-            else            $res[] = "mysqldump failed: " . implode(' ', $o);
+            if ($ret === 0) {
+                $res[] = "SQL dump: backup_{$ts}.sql";
+            } else {
+                $res[] = "mysqldump failed: " . implode(' ', $o);
+            }
         } else {
             $res[] = "mysqldump not found; skipping DB dump";
         }
@@ -651,39 +889,60 @@ function handleBackup(): void {
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
-function countFiles(string $dir): int {
+function countFiles(string $dir): int
+{
     $n = 0;
-    foreach (new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS)) as $f)
-        if ($f->isFile()) $n++;
+    foreach (new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS)) as $f) {
+        if ($f->isFile()) {
+            $n++;
+        }
+    }
     return $n;
 }
 
-function rmdirRecursive(string $dir): void {
-    if (!is_dir($dir)) return;
+function rmdirRecursive(string $dir): void
+{
+    if (!is_dir($dir)) {
+        return;
+    }
     $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS), RecursiveIteratorIterator::CHILD_FIRST);
-    foreach ($it as $f) $f->isDir() ? rmdir($f->getPathname()) : unlink($f->getPathname());
+    foreach ($it as $f) {
+        $f->isDir() ? rmdir($f->getPathname()) : unlink($f->getPathname());
+    }
     rmdir($dir);
 }
 
-function clearDir(string $dir): void {
+function clearDir(string $dir): void
+{
     $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS), RecursiveIteratorIterator::CHILD_FIRST);
-    foreach ($it as $f) $f->isDir() ? rmdir($f->getPathname()) : unlink($f->getPathname());
+    foreach ($it as $f) {
+        $f->isDir() ? rmdir($f->getPathname()) : unlink($f->getPathname());
+    }
 }
 
-function fmtSize(int $b): string {
-    if ($b >= 1073741824) return round($b / 1073741824, 2) . ' GB';
-    if ($b >= 1048576)    return round($b / 1048576, 2) . ' MB';
-    if ($b >= 1024)       return round($b / 1024, 2) . ' KB';
+function fmtSize(int $b): string
+{
+    if ($b >= 1073741824) {
+        return round($b / 1073741824, 2) . ' GB';
+    }
+    if ($b >= 1048576) {
+        return round($b / 1048576, 2) . ' MB';
+    }
+    if ($b >= 1024) {
+        return round($b / 1024, 2) . ' KB';
+    }
     return $b . ' B';
 }
 
-function jsonOk(array $data = []): never {
+function jsonOk(array $data = []): never
+{
     header('Content-Type: application/json');
     echo json_encode(['ok' => true] + $data);
     exit;
 }
 
-function jsonErr(string $msg, int $code = 200): never {
+function jsonErr(string $msg, int $code = 200): never
+{
     header('Content-Type: application/json');
     http_response_code($code);
     echo json_encode(['ok' => false, 'error' => $msg]);
@@ -692,7 +951,9 @@ function jsonErr(string $msg, int $code = 200): never {
 
 // ── HTML / UI ─────────────────────────────────────────────────────────────────
 
-function showHtml(): never { ?>
+function showHtml(): never
+{
+    ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -981,7 +1242,7 @@ select option{background:#1a1d27}
             <div style="font-size:48px;margin-bottom:16px">✅</div>
             <h2 style="margin-bottom:8px">Restore complete</h2>
             <p style="color:#64748b;margin-bottom:24px">Check the site, then delete <code><?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?></code> and the <code>restore_work/</code> directory.</p>
-            <button class="btn btn-danger" onclick="if(confirm('Delete <?= htmlspecialchars(basename(__FILE__), ENT_JS) ?>?'))alert('Delete it manually — this tool cannot delete itself safely.')">Delete <?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?></button>
+            <button class="btn btn-danger" onclick="if(confirm('Delete <?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?>?'))alert('Delete it manually — this tool cannot delete itself safely.')">Delete <?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?></button>
           </div>
         </div>
 
@@ -1414,4 +1675,5 @@ init();
 </script>
 </body>
 </html>
-<?php exit; }
+    <?php exit;
+}

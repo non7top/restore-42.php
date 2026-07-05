@@ -104,5 +104,5 @@ jobs:
       - name: Test — HTML page renders
         run: |
           resp=$(curl -sf http://127.0.0.1:8080/restore-42.php)
-          echo "$resp" | grep -q 'restore-42.php'
+          echo "$resp" | grep -q 'auth-screen'
           echo "$resp" | grep -q '<script'
