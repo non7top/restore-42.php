@@ -105,6 +105,9 @@ switch ($action) {
     case 'verify_file':
         handleVerifyFile();
         break;
+    case 'download_upstream':
+        handleDownloadUpstream();
+        break;
     case 'download_backup':
         handleDownloadBackup();
         break;
@@ -1138,6 +1141,43 @@ function handleDownloadBackup(): never
     exit;
 }
 
+// ── Upstream Bitrix scripts ───────────────────────────────────────────────────
+
+function handleDownloadUpstream(): void
+{
+    $scripts = [
+        'restore'      => ['url' => 'https://www.1c-bitrix.ru/download/scripts/restore.php',      'file' => 'restore.php'],
+        'bitrixsetup'  => ['url' => 'https://www.1c-bitrix.ru/download/scripts/bitrixsetup.php',  'file' => 'bitrixsetup.php'],
+    ];
+    $key  = $_POST['script'] ?? '';
+    if (!isset($scripts[$key])) {
+        jsonErr('Unknown script');
+    }
+    $url  = $scripts[$key]['url'];
+    $dest = __DIR__ . '/' . $scripts[$key]['file'];
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_TIMEOUT        => 60,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_USERAGENT      => 'Mozilla/5.0',
+    ]);
+    $body = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err  = curl_error($ch);
+    curl_close($ch);
+
+    if ($body === false || $code !== 200) {
+        jsonErr('Download failed: ' . ($err ?: "HTTP $code"));
+    }
+    if (file_put_contents($dest, $body) === false) {
+        jsonErr('Could not write file — check permissions on ' . __DIR__);
+    }
+    jsonOk(['file' => $scripts[$key]['file'], 'size' => strlen($body)]);
+}
+
 // ── HTML / UI ─────────────────────────────────────────────────────────────────
 
 function showHtml(): never
@@ -1438,6 +1478,16 @@ select option{background:#1a1d27}
             <h2 style="margin-bottom:8px">Restore complete</h2>
             <p style="color:#64748b;margin-bottom:24px">Check the site, then delete <code><?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?></code> and the <code>.restore/</code> directory.</p>
             <button class="btn btn-danger" onclick="if(confirm('Delete <?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?>?'))alert('Delete it manually — this tool cannot delete itself safely.')">Delete <?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?></button>
+          </div>
+
+          <div class="panel">
+            <div class="panel-title">Get official Bitrix scripts</div>
+            <p style="color:#94a3b8;font-size:13px;margin-bottom:16px">Fetch the upstream script from 1c-bitrix.ru and save it to this directory.</p>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+              <button class="btn btn-secondary" onclick="doGetUpstream('restore')">⬇ restore.php</button>
+              <button class="btn btn-secondary" onclick="doGetUpstream('bitrixsetup')">⬇ bitrixsetup.php</button>
+              <span id="upstream-result" style="font-size:13px;color:#94a3b8"></span>
+            </div>
           </div>
         </div>
 
@@ -1891,6 +1941,17 @@ async function doBackup() {
      <a href="${API('download_backup')}&file=${encodeURIComponent(f.name)}" class="btn btn-secondary btn-sm" download>⬇️</a>
     </div>`
   ).join('');
+}
+
+// ── Upstream scripts ─────────────────────────────────────────────────────────
+
+async function doGetUpstream(script) {
+  const out = document.getElementById('upstream-result');
+  out.textContent = 'Downloading…';
+  const r = await post('download_upstream', {script});
+  if (!r.ok) { out.textContent = '✗ ' + r.error; return; }
+  const path = location.pathname.replace(/\/[^/]*$/, '/') + r.file;
+  out.innerHTML = `✓ Saved — <a href="${path}" target="_blank">${r.file}</a> (${fmtSize(r.size)})`;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
