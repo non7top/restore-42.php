@@ -636,13 +636,15 @@ function handleScan(): void
     // Auto-extract any inner archives (e.g. outer zip contains site.zip + dump.sql)
     extractInnerArchives($root);
 
-    $fw   = detectFramework($root);
-    $sqls = findSqlFiles(EXTRACT_DIR);
+    $fw      = detectFramework($root);
+    $fwRoot  = findFrameworkRoot($root);
+    $sqls    = findSqlFiles(EXTRACT_DIR);
     // Fall back to SQL-based detection when the extract dir has no framework files
     if ($fw === 'unknown' && !empty($sqls)) {
         $fw = detectFrameworkFromSql($sqls[0]['path']);
     }
-    jsonOk(['root' => $root, 'nested' => $nested, 'framework' => $fw, 'sqls' => $sqls, 'files' => countFiles($root)]);
+    $dbCreds = extractDbCredentials($fwRoot, $fw);
+    jsonOk(['root' => $root, 'nested' => $nested, 'framework' => $fw, 'sqls' => $sqls, 'files' => countFiles($root), 'db_credentials' => $dbCreds]);
 }
 
 /**
@@ -708,8 +710,15 @@ function detectFramework(string $dir): string
 
 function detectFrameworkDir(string $dir): string
 {
+    // Config files are more reliable than directory names alone
+    if (file_exists($dir . '/bitrix/.settings.php') || file_exists($dir . '/bitrix/php_interface/dbconn.php')) {
+        return 'bitrix';
+    }
     if (is_dir($dir . '/bitrix') && file_exists($dir . '/bitrix/modules/main/include.php')) {
         return 'bitrix';
+    }
+    if (file_exists($dir . '/wa-config/db.php') || file_exists($dir . '/wa-config/SystemConfig.class.php')) {
+        return 'webasyst';
     }
     if (file_exists($dir . '/wp-config.php') || file_exists($dir . '/wp-includes/version.php')) {
         return 'wordpress';
@@ -721,6 +730,104 @@ function detectFrameworkDir(string $dir): string
         return 'webasyst';
     }
     return 'unknown';
+}
+
+/**
+ * Return the specific directory within $dir (or an _extracted sub) where the
+ * framework files were found — used to locate config files for credential extraction.
+ */
+function findFrameworkRoot(string $dir): string
+{
+    if (detectFrameworkDir($dir) !== 'unknown') {
+        return $dir;
+    }
+    foreach (glob($dir . '/*_extracted', GLOB_ONLYDIR) ?: [] as $sub) {
+        $nested = singleNestedDir($sub);
+        $root   = $nested ? $sub . '/' . $nested : $sub;
+        if (detectFrameworkDir($root) !== 'unknown') {
+            return $root;
+        }
+    }
+    return $dir;
+}
+
+/**
+ * Parse framework config files and return DB connection parameters.
+ * Returns keys: db_host, db_port, db_user, db_pass, db_name (all strings, port is int-as-string).
+ */
+function extractDbCredentials(string $dir, string $fw): array
+{
+    $c = [];
+    switch ($fw) {
+        case 'wordpress':
+            $src = @file_get_contents($dir . '/wp-config.php');
+            if (!$src) break;
+            $map = ['DB_NAME' => 'db_name', 'DB_USER' => 'db_user', 'DB_PASSWORD' => 'db_pass', 'DB_HOST' => 'db_host'];
+            foreach ($map as $const => $key) {
+                if (preg_match('/define\s*\(\s*[\'"]' . $const . '[\'"]\s*,\s*[\'"]([^\'"]*)[\'"]/', $src, $m)) {
+                    $c[$key] = $m[1];
+                }
+            }
+            // DB_HOST may be "host:port"
+            if (!empty($c['db_host']) && str_contains($c['db_host'], ':')) {
+                [$h, $p] = explode(':', $c['db_host'], 2);
+                $c['db_host'] = $h;
+                if (is_numeric($p)) $c['db_port'] = (int)$p;
+            }
+            break;
+
+        case 'bitrix':
+            $src = @file_get_contents($dir . '/bitrix/.settings.php');
+            if ($src) {
+                // Newer format: 'host', 'database', 'login', 'password' inside connections.value.default
+                $kmap = ['host' => 'db_host', 'database' => 'db_name', 'login' => 'db_user', 'password' => 'db_pass', 'port' => 'db_port'];
+                foreach ($kmap as $k => $out) {
+                    if (preg_match('/[\'"]' . $k . '[\'"]\s*=>\s*[\'"]([^\'"]*)[\'"]/', $src, $m) && $m[1] !== '') {
+                        $c[$out] = ($out === 'db_port') ? (int)$m[1] : $m[1];
+                    }
+                }
+            }
+            if (empty($c)) {
+                // Older format: $DBLogin, $DBPassword, $DBName, $DBHost in dbconn.php
+                $src = @file_get_contents($dir . '/bitrix/php_interface/dbconn.php');
+                if ($src) {
+                    $kmap = ['DBName' => 'db_name', 'DBLogin' => 'db_user', 'DBPassword' => 'db_pass', 'DBHost' => 'db_host'];
+                    foreach ($kmap as $k => $out) {
+                        if (preg_match('/\$' . $k . '\s*=\s*["\']([^"\']*)["\']/', $src, $m)) {
+                            $c[$out] = $m[1];
+                        }
+                    }
+                }
+            }
+            break;
+
+        case 'webasyst':
+            $src = @file_get_contents($dir . '/wa-config/db.php');
+            if ($src) {
+                $kmap = ['host' => 'db_host', 'user' => 'db_user', 'password' => 'db_pass', 'name' => 'db_name', 'port' => 'db_port'];
+                foreach ($kmap as $k => $out) {
+                    if (preg_match('/[\'"]' . $k . '[\'"]\s*=>\s*[\'"]([^\'"]*)[\'"]/', $src, $m) && $m[1] !== '') {
+                        $c[$out] = ($out === 'db_port') ? (int)$m[1] : $m[1];
+                    }
+                }
+            }
+            break;
+
+        case 'modx':
+            foreach ([$dir . '/core/config/config.inc.php', $dir . '/manager/includes/config.inc.php'] as $cfg) {
+                $src = @file_get_contents($cfg);
+                if (!$src) continue;
+                $kmap = ['database_server' => 'db_host', 'dbase' => 'db_name', 'database_user' => 'db_user', 'database_password' => 'db_pass'];
+                foreach ($kmap as $k => $out) {
+                    if (preg_match('/\$' . $k . '\s*=\s*["\']([^"\']*)["\']/', $src, $m)) {
+                        $c[$out] = $m[1];
+                    }
+                }
+                break;
+            }
+            break;
+    }
+    return $c;
 }
 
 function detectFrameworkFromSql(string $path): string
@@ -767,7 +874,15 @@ function detectFrameworkFromSql(string $path): string
 function findSqlFiles(string $base): array
 {
     $files = [];
-    $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($base, FilesystemIterator::SKIP_DOTS));
+    $skipDirs = ['vendor', 'tests', 'test', 'fixtures', 'expected', 'node_modules'];
+    $dirIter  = new RecursiveDirectoryIterator($base, FilesystemIterator::SKIP_DOTS);
+    $filtered = new RecursiveCallbackFilterIterator($dirIter, function ($f) use ($skipDirs) {
+        if ($f->isDir()) {
+            return !in_array(strtolower($f->getFilename()), $skipDirs, true);
+        }
+        return true;
+    });
+    $it = new RecursiveIteratorIterator($filtered);
     foreach ($it as $f) {
         if (!$f->isFile()) {
             continue;
@@ -2111,6 +2226,17 @@ async function doExtract() {
   document.getElementById('fw-select').value = scan.framework || 'unknown';
   document.getElementById('fw-root').value = scan.root || '';
   document.getElementById('topbar-fw').textContent = scan.framework !== 'unknown' ? '🔍 ' + scan.framework : '';
+
+  // Pre-fill DB credentials extracted from framework config file
+  const creds = scan.db_credentials || {};
+  if (Object.keys(creds).length) {
+    if (creds.db_host) document.getElementById('db-host').value = creds.db_host;
+    if (creds.db_port) document.getElementById('db-port').value = creds.db_port;
+    if (creds.db_user) document.getElementById('db-user').value = creds.db_user;
+    if (creds.db_pass) document.getElementById('db-pass').value = creds.db_pass;
+    if (creds.db_name) document.getElementById('db-name').value = creds.db_name;
+    log.innerHTML += `<div class="log-line log-ok">DB credentials read from config — host: ${creds.db_host || '?'}, db: ${creds.db_name || '?'}</div>`;
+  }
 }
 
 // ── SQL import ────────────────────────────────────────────────────────────────
