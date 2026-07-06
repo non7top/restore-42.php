@@ -662,28 +662,41 @@ function detectFramework(string $dir): string
 
 function detectFrameworkFromSql(string $path): string
 {
+    // Read up to 512 KB — enough to see the first several CREATE TABLE statements
+    // without loading a 150 MB dump into memory.
     $gz = str_ends_with(strtolower($path), '.gz');
     $h  = '';
     if ($gz) {
         $g = @gzopen($path, 'r');
-        if ($g) { $h = gzread($g, 8192); gzclose($g); }
+        if ($g) { $h = gzread($g, 524288); gzclose($g); }
     } else {
         $fp = @fopen($path, 'r');
-        if ($fp) { $h = fread($fp, 8192); fclose($fp); }
+        if ($fp) { $h = fread($fp, 524288); fclose($fp); }
     }
-    if (preg_match('/CREATE TABLE `b_(user|option|iblock|agent)\b/i', $h)) {
-        return 'bitrix';
+
+    // Score each framework by counting distinct matching table names found.
+    $scores = ['bitrix' => 0, 'wordpress' => 0, 'modx' => 0, 'webasyst' => 0];
+
+    preg_match_all('/CREATE TABLE `([^`]+)`/i', $h, $m);
+    foreach ($m[1] as $tbl) {
+        if (preg_match('/^b_(user|option|iblock|agent|event|file|group|lang|module|task|vote)$/', $tbl)) {
+            $scores['bitrix'] += 10;
+        } elseif (preg_match('/^wa_(auth_user|contact|contact_data|app_settings|log|routing|transaction)$/', $tbl)) {
+            $scores['webasyst'] += 10;
+        } elseif (preg_match('/^(modx_users|modx_site_content|modx_site_templates|modx_web_groups)$/', $tbl)) {
+            $scores['modx'] += 10;
+        } elseif (preg_match('/^\w*wp_(options|posts|users|usermeta|terms|postmeta|comments)$/', $tbl)) {
+            $scores['wordpress'] += 10;
+        }
+        // Penalise WP plugin tables (wp_*_something) — present on Webasyst+WP hybrid sites
+        if (preg_match('/^wp_\d+_/', $tbl)) {
+            $scores['wordpress'] -= 3;
+        }
     }
-    if (preg_match('/CREATE TABLE `\w*wp_\w+`/i', $h)) {
-        return 'wordpress';
-    }
-    if (preg_match('/CREATE TABLE `modx_(users|site_content)\b/i', $h)) {
-        return 'modx';
-    }
-    if (preg_match('/CREATE TABLE `wa_(auth_user|contact)\b/i', $h)) {
-        return 'webasyst';
-    }
-    return 'unknown';
+
+    arsort($scores);
+    $top = key($scores);
+    return $scores[$top] > 0 ? $top : 'unknown';
 }
 
 // ── SQL heuristics ────────────────────────────────────────────────────────────
