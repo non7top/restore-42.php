@@ -102,6 +102,9 @@ switch ($action) {
     case 'cancel_upload':
         handleCancelUpload();
         break;
+    case 'verify_file':
+        handleVerifyFile();
+        break;
     case 'download_backup':
         handleDownloadBackup();
         break;
@@ -228,13 +231,15 @@ function handleUpload(): void
                 unlink($cp);
             }
             fclose($fp);
-            jsonOk(['file' => $name, 'done' => true]);
+            $verified = verifyFileSha256($dest);
+            jsonOk(['file' => $name, 'done' => true, 'verified' => $verified]);
         }
         jsonOk(['chunk' => $chunk, 'done' => false]);
     }
 
     move_uploaded_file($f['tmp_name'], $dest);
-    jsonOk(['file' => $name, 'size' => filesize($dest), 'done' => true]);
+    $verified = verifyFileSha256($dest);
+    jsonOk(['file' => $name, 'size' => filesize($dest), 'done' => true, 'verified' => $verified]);
 }
 
 function handleListFiles(): void
@@ -244,7 +249,14 @@ function handleListFiles(): void
         if (!is_file($f) || str_contains(basename($f), '.chunk')) {
             continue;
         }
-        $files[] = ['name' => basename($f), 'size' => filesize($f), 'type' => detectUploadType($f)];
+        $h = readEmbeddedSha256($f);
+        $files[] = [
+            'name'   => basename($f),
+            'size'   => filesize($f),
+            'type'   => detectUploadType($f),
+            'sha256' => $h ? substr($h, 0, 8) . '…' : null,
+            'sha256full' => $h,
+        ];
     }
     jsonOk(['files' => $files]);
 }
@@ -284,6 +296,142 @@ function detectUploadType(string $path): string
         return 'part';
     }
     return 'unknown';
+}
+
+// ── SHA-256 integrity ─────────────────────────────────────────────────────────
+
+/**
+ * Embed SHA-256 of the current file content at the end.
+ *
+ * ZIP   — hash stored in EOCD comment field; transparent to zip/unzip (shown in file info).
+ * Other — "SHA256:<hex>\n" (72 bytes) appended; tar stops at terminal zero-blocks and never reads it.
+ *
+ * The hash covers content as it exists BEFORE embedding:
+ *   ZIP:   bytes 0..(eocdOffset+19) then two NUL bytes (comment_length=0)
+ *   Other: entire file
+ */
+function embedFileSha256(string $path): string
+{
+    if (strtolower(pathinfo($path, PATHINFO_EXTENSION)) === 'zip') {
+        return embedSha256Zip($path);
+    }
+    $hash = hash_file('sha256', $path);
+    file_put_contents($path, 'SHA256:' . $hash . "\n", FILE_APPEND);
+    return $hash;
+}
+
+/** Read stored SHA-256 without recomputing. Returns null if not embedded. */
+function readEmbeddedSha256(string $path): ?string
+{
+    if (strtolower(pathinfo($path, PATHINFO_EXTENSION)) === 'zip') {
+        return readSha256Zip($path);
+    }
+    $size = filesize($path);
+    if ($size < 72) return null;
+    $fp = fopen($path, 'rb');
+    fseek($fp, $size - 72);
+    $tail = fread($fp, 72);
+    fclose($fp);
+    return preg_match('/^SHA256:([a-f0-9]{64})\n$/', $tail, $m) ? $m[1] : null;
+}
+
+/** Recompute SHA-256 and compare with embedded hash. Returns null if no hash is embedded. */
+function verifyFileSha256(string $path): ?bool
+{
+    if (strtolower(pathinfo($path, PATHINFO_EXTENSION)) === 'zip') {
+        return verifySha256Zip($path);
+    }
+    $size = filesize($path);
+    if ($size < 72) return null;
+    $fp = fopen($path, 'rb');
+    fseek($fp, $size - 72);
+    $tail = fread($fp, 72);
+    fclose($fp);
+    if (!preg_match('/^SHA256:([a-f0-9]{64})\n$/', $tail, $m)) return null;
+    return hash_equals($m[1], streamHashBytes($path, $size - 72));
+}
+
+/** Find EOCD in a ZIP. Returns [absoluteOffset, commentLen] or null. */
+function findZipEocd(string $path): ?array
+{
+    $size = filesize($path);
+    if ($size < 22) return null;
+    $searchLen = min(22 + 65535, $size);
+    $fp = fopen($path, 'rb');
+    fseek($fp, $size - $searchLen);
+    $buf = fread($fp, $searchLen);
+    fclose($fp);
+    for ($i = strlen($buf) - 22; $i >= 0; $i--) {
+        if (substr($buf, $i, 4) !== "\x50\x4b\x05\x06") continue;
+        $cl = unpack('v', substr($buf, $i + 20, 2))[1];
+        if ($i + 22 + $cl === strlen($buf)) {
+            return [($size - $searchLen) + $i, $cl];
+        }
+    }
+    return null;
+}
+
+function embedSha256Zip(string $path): string
+{
+    $eocd = findZipEocd($path);
+    if ($eocd === null) {
+        $hash = hash_file('sha256', $path);
+        file_put_contents($path, 'SHA256:' . $hash . "\n", FILE_APPEND);
+        return $hash;
+    }
+    [$eocdOff] = $eocd;
+    $hash    = streamHashBytes($path, $eocdOff + 20, "\x00\x00");
+    $comment = 'SHA256:' . $hash;
+    $fp      = fopen($path, 'r+b');
+    fseek($fp, $eocdOff + 20);
+    fwrite($fp, pack('v', strlen($comment)) . $comment);
+    ftruncate($fp, $eocdOff + 22 + strlen($comment));
+    fclose($fp);
+    return $hash;
+}
+
+function readSha256Zip(string $path): ?string
+{
+    $eocd = findZipEocd($path);
+    if ($eocd === null || $eocd[1] < 71) return null;
+    [$eocdOff, $cl] = $eocd;
+    $fp = fopen($path, 'rb');
+    fseek($fp, $eocdOff + 22);
+    $comment = fread($fp, $cl);
+    fclose($fp);
+    return preg_match('/^SHA256:([a-f0-9]{64})/', $comment, $m) ? $m[1] : null;
+}
+
+function verifySha256Zip(string $path): ?bool
+{
+    $eocd = findZipEocd($path);
+    if ($eocd === null || $eocd[1] < 71) return null;
+    [$eocdOff, $cl] = $eocd;
+    $fp = fopen($path, 'rb');
+    fseek($fp, $eocdOff + 22);
+    $comment = fread($fp, $cl);
+    fclose($fp);
+    if (!preg_match('/^SHA256:([a-f0-9]{64})/', $comment, $m)) return null;
+    return hash_equals($m[1], streamHashBytes($path, $eocdOff + 20, "\x00\x00"));
+}
+
+/** Stream-hash the first $length bytes of $path, then optionally suffix with $extra. */
+function streamHashBytes(string $path, int $length, string $extra = ''): string
+{
+    $ctx = hash_init('sha256');
+    $fp  = fopen($path, 'rb');
+    $rem = $length;
+    while ($rem > 0) {
+        $buf = fread($fp, min(65536, $rem));
+        if ($buf === false || $buf === '') break;
+        hash_update($ctx, $buf);
+        $rem -= strlen($buf);
+    }
+    fclose($fp);
+    if ($extra !== '') {
+        hash_update($ctx, $extra);
+    }
+    return hash_final($ctx);
 }
 
 // ── Join split parts ─────────────────────────────────────────────────────────
@@ -883,19 +1031,30 @@ function handleBackup(): void
                 unlink($archive);
                 $res[] = "Archive split into {$split}MB parts (Bitrix format)";
             } else {
+                embedFileSha256($archive);
                 $res[] = "Archive: backup_{$ts}.tar.gz (" . fmtSize($sz) . ")";
             }
         } else {
+            embedFileSha256($archive);
             $res[] = "Archive: backup_{$ts}.tar.gz (" . fmtSize($sz) . ")";
         }
     } else {
         $res[] = "tar failed: " . implode(' ', $o);
     }
 
-    // Collect files
+    // Collect files, embedding SHA-256 in any split parts
     $files = [];
     foreach (glob($base . '*') as $f) {
-        $files[] = ['name' => basename($f), 'size' => filesize($f)];
+        // Parts from `split` have no embedded hash yet — add one
+        if (!readEmbeddedSha256($f)) {
+            embedFileSha256($f);
+        }
+        $h = readEmbeddedSha256($f);
+        $files[] = [
+            'name'   => basename($f),
+            'size'   => filesize($f),
+            'sha256' => $h ? substr($h, 0, 8) . '…' : null,
+        ];
     }
 
     jsonOk(['results' => $res, 'files' => $files]);
@@ -1441,6 +1600,7 @@ async function uploadFile(file) {
   let failed = false;
   let failReason = '';
   let ctrl = null;
+  let lastResp = null;
   document.getElementById(`${pbId}-cancel`).onclick = () => { cancelled = true; ctrl?.abort(); };
 
   const started = Date.now();
@@ -1482,6 +1642,7 @@ async function uploadFile(file) {
       break;
     }
     if (!resp.ok) { failed = true; failReason = `Server error ${resp.status}`; break; }
+    lastResp = await resp.json().catch(() => null);
     bytesDone += Math.min(CHUNK, file.size - c * CHUNK);
     lastPct = Math.round((c + 1) / chunks * 100);
     const elapsed = (Date.now() - started) / 1000 || 0.001;
@@ -1521,7 +1682,10 @@ async function uploadFile(file) {
   } else {
     div.querySelector('.file-icon').textContent = '✅';
     const total = (Date.now() - started) / 1000;
-    if (meta) meta.textContent = `Done · ${fmtSize(file.size)} in ${fmtTime(total)}`;
+    const verTag = lastResp?.verified === true  ? ' · 🔒 checksum ok'
+                 : lastResp?.verified === false ? ' · ⚠️ checksum MISMATCH'
+                 : '';
+    if (meta) meta.textContent = `Done · ${fmtSize(file.size)} in ${fmtTime(total)}${verTag}`;
   }
   await loadFileList();
 }
@@ -1543,11 +1707,14 @@ async function loadFileList() {
     const badge = {sql:'<span class="badge badge-blue">SQL</span>',
                    archive:'<span class="badge badge-green">Archive</span>',
                    part:'<span class="badge badge-yellow">Part</span>'}[f.type] || '';
+    const hashBadge = f.sha256full
+      ? `<span title="SHA-256: ${f.sha256full}" style="font-family:monospace;font-size:11px;color:#64748b;cursor:help">🔒 ${f.sha256}</span>`
+      : '';
     return `<li class="file-item">
       <span class="file-icon">${icon}</span>
       <div class="file-info">
         <div class="file-name">${f.name} ${badge}</div>
-        <div class="file-meta">${fmtSize(f.size)}</div>
+        <div class="file-meta">${fmtSize(f.size)} ${hashBadge}</div>
       </div>
       <button class="btn btn-secondary btn-sm" onclick="deleteFile('${f.name}')">✕</button>
     </li>`;
