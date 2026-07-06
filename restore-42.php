@@ -516,31 +516,75 @@ function extractZip(string $src, string $dst): array
 
 function extractTarGz(string $src, string $dst): array
 {
-    exec('tar -xzf ' . escapeshellarg($src) . ' -C ' . escapeshellarg($dst) . ' 2>&1', $o, $c);
-    if ($c === 0) {
-        return ['ok' => true];
-    }
-    // Try PharData
+    // Prefer PHP native — no dependency on tar binary
     try {
         (new PharData($src))->extractTo($dst, null, true);
         return ['ok' => true];
     } catch (Throwable $e) {
+        $pharErr = $e->getMessage();
     }
-    return ['ok' => false, 'err' => implode("\n", $o)];
+    // PharData can fail on archives with appended trailing bytes (e.g. our SHA-256 tag).
+    // Strip the tag to a temp file and retry before falling back to shell.
+    if (readEmbeddedSha256($src) !== null) {
+        $tmp = $src . '.notag.tmp';
+        if (streamCopyBytes($src, $tmp, filesize($src) - 72)) {
+            try {
+                (new PharData($tmp))->extractTo($dst, null, true);
+                unlink($tmp);
+                return ['ok' => true];
+            } catch (Throwable $e2) {
+                $pharErr = $e2->getMessage();
+            }
+            unlink($tmp);
+        }
+    }
+    exec('tar -xzf ' . escapeshellarg($src) . ' -C ' . escapeshellarg($dst) . ' 2>&1', $o, $c);
+    return $c === 0 ? ['ok' => true] : ['ok' => false, 'err' => $pharErr . ' | ' . implode("\n", $o)];
 }
 
 function extractTar(string $src, string $dst): array
 {
-    exec('tar -xf ' . escapeshellarg($src) . ' -C ' . escapeshellarg($dst) . ' 2>&1', $o, $c);
-    if ($c === 0) {
-        return ['ok' => true];
-    }
     try {
         (new PharData($src))->extractTo($dst, null, true);
         return ['ok' => true];
     } catch (Throwable $e) {
+        $pharErr = $e->getMessage();
     }
-    return ['ok' => false, 'err' => implode("\n", $o)];
+    if (readEmbeddedSha256($src) !== null) {
+        $tmp = $src . '.notag.tmp';
+        if (streamCopyBytes($src, $tmp, filesize($src) - 72)) {
+            try {
+                (new PharData($tmp))->extractTo($dst, null, true);
+                unlink($tmp);
+                return ['ok' => true];
+            } catch (Throwable $e2) {
+                $pharErr = $e2->getMessage();
+            }
+            unlink($tmp);
+        }
+    }
+    exec('tar -xf ' . escapeshellarg($src) . ' -C ' . escapeshellarg($dst) . ' 2>&1', $o, $c);
+    return $c === 0 ? ['ok' => true] : ['ok' => false, 'err' => $pharErr . ' | ' . implode("\n", $o)];
+}
+
+/** Copy exactly $length bytes from $src to $dst. Returns true on success. */
+function streamCopyBytes(string $src, string $dst, int $length): bool
+{
+    $in  = fopen($src, 'rb');
+    $out = fopen($dst, 'wb');
+    if (!$in || !$out) {
+        return false;
+    }
+    $rem = $length;
+    while ($rem > 0) {
+        $buf = fread($in, min(65536, $rem));
+        if ($buf === false || $buf === '') break;
+        fwrite($out, $buf);
+        $rem -= strlen($buf);
+    }
+    fclose($in);
+    fclose($out);
+    return $rem === 0;
 }
 
 function singleNestedDir(string $dir): ?string
@@ -1017,13 +1061,20 @@ function handleBackup(): void
         }
     }
 
-    // 2. Files archive
+    // 2. Files archive — prefer shell tar (faster, supports --exclude);
+    //    fall back to PharData for hosts where tar is not available.
     $archive = $base . '.tar.gz';
     $excludes = ' --exclude=' . escapeshellarg(basename(WORK_DIR))
               . ' --exclude=' . escapeshellarg(basename(__FILE__));
     $tarCmd = "tar -czf " . escapeshellarg($archive) . $excludes .
               " -C " . escapeshellarg(dirname($rootDir)) . " " . escapeshellarg(basename($rootDir)) . " 2>&1";
     exec($tarCmd, $o, $ret);
+
+    if ($ret !== 0 || !file_exists($archive)) {
+        // shell tar unavailable — use PharData
+        $ret = createTarGzNative($rootDir, $archive, [basename(WORK_DIR), basename(__FILE__)]) ? 0 : 1;
+        $o   = $ret !== 0 ? ['PharData archive creation failed'] : [];
+    }
 
     if ($ret === 0 && file_exists($archive)) {
         $sz = filesize($archive);
@@ -1064,6 +1115,41 @@ function handleBackup(): void
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
+
+/**
+ * Create a .tar.gz from $rootDir using PharData (no shell dependency).
+ * $exclude: basenames to skip at the root level.
+ */
+function createTarGzNative(string $rootDir, string $dest, array $exclude = []): bool
+{
+    $tarPath = substr($dest, 0, -3); // strip .gz → .tar
+    try {
+        $phar = new PharData($tarPath);
+        $it   = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($rootDir, FilesystemIterator::SKIP_DOTS)
+        );
+        foreach ($it as $file) {
+            $rel = substr($file->getPathname(), strlen($rootDir) + 1);
+            $top = explode(DIRECTORY_SEPARATOR, $rel)[0];
+            if (in_array($top, $exclude, true)) {
+                continue;
+            }
+            if ($file->isFile()) {
+                $phar->addFile($file->getPathname(), $rel);
+            }
+        }
+        $phar->compress(Phar::GZ);     // creates $tarPath.gz
+        unlink($tarPath);
+        // PharData names the output $tarPath.gz, we want $dest (.tar.gz)
+        if ($tarPath . '.gz' !== $dest && file_exists($tarPath . '.gz')) {
+            rename($tarPath . '.gz', $dest);
+        }
+        return file_exists($dest);
+    } catch (Throwable $e) {
+        @unlink($tarPath);
+        return false;
+    }
+}
 
 function countFiles(string $dir): int
 {
@@ -1355,6 +1441,16 @@ select option{background:#1a1d27}
             </div>
           </div>
 
+          <div class="panel">
+            <div class="panel-title">Get official Bitrix scripts</div>
+            <p style="color:#94a3b8;font-size:13px;margin-bottom:12px">Fetch upstream from 1c-bitrix.ru and save to this directory.</p>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+              <button class="btn btn-secondary btn-sm" onclick="doGetUpstream('restore')">⬇ restore.php</button>
+              <button class="btn btn-secondary btn-sm" onclick="doGetUpstream('bitrixsetup')">⬇ bitrixsetup.php</button>
+              <span id="upstream-result" style="font-size:13px;color:#94a3b8"></span>
+            </div>
+          </div>
+
           <div style="text-align:right;margin-top:8px">
             <button class="btn btn-primary" onclick="goStep(2)">Next: Extract →</button>
           </div>
@@ -1480,15 +1576,6 @@ select option{background:#1a1d27}
             <button class="btn btn-danger" onclick="if(confirm('Delete <?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?>?'))alert('Delete it manually — this tool cannot delete itself safely.')">Delete <?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?></button>
           </div>
 
-          <div class="panel">
-            <div class="panel-title">Get official Bitrix scripts</div>
-            <p style="color:#94a3b8;font-size:13px;margin-bottom:16px">Fetch the upstream script from 1c-bitrix.ru and save it to this directory.</p>
-            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-              <button class="btn btn-secondary" onclick="doGetUpstream('restore')">⬇ restore.php</button>
-              <button class="btn btn-secondary" onclick="doGetUpstream('bitrixsetup')">⬇ bitrixsetup.php</button>
-              <span id="upstream-result" style="font-size:13px;color:#94a3b8"></span>
-            </div>
-          </div>
         </div>
 
       </div><!-- /pane-restore -->
