@@ -509,6 +509,33 @@ function extractZip(string $src, string $dst): array
         if ($z->open($src) !== true) {
             return ['ok' => false, 'err' => 'Cannot open ZIP'];
         }
+        // Detect if the archive uses OEM/CP866 encoding (Windows Cyrillic ZIPs).
+        // If any entry name is not valid UTF-8, convert from CP866 manually.
+        $needsConv = false;
+        for ($i = 0; $i < $z->numFiles; $i++) {
+            if (!mb_check_encoding($z->getNameIndex($i), 'UTF-8')) {
+                $needsConv = true;
+                break;
+            }
+        }
+        if ($needsConv) {
+            for ($i = 0; $i < $z->numFiles; $i++) {
+                $raw  = $z->getNameIndex($i, ZipArchive::FL_ENC_RAW);
+                $name = mb_convert_encoding($raw, 'UTF-8', 'CP866');
+                if (!mb_check_encoding($name, 'UTF-8')) {
+                    $name = mb_convert_encoding($raw, 'UTF-8', 'CP1251');
+                }
+                $out = $dst . '/' . $name;
+                if (str_ends_with($name, '/')) {
+                    @mkdir($out, 0755, true);
+                } else {
+                    @mkdir(dirname($out), 0755, true);
+                    file_put_contents($out, $z->getFromIndex($i));
+                }
+            }
+            $z->close();
+            return ['ok' => true];
+        }
         $z->extractTo($dst);
         $z->close();
         return ['ok' => true];
@@ -607,6 +634,10 @@ function handleScan(): void
     $root   = $nested ? EXTRACT_DIR . '/' . $nested : EXTRACT_DIR;
     $fw     = detectFramework($root);
     $sqls   = findSqlFiles(EXTRACT_DIR);
+    // Fall back to SQL-based detection when the extract dir has no framework files
+    if ($fw === 'unknown' && !empty($sqls)) {
+        $fw = detectFrameworkFromSql($sqls[0]['path']);
+    }
     jsonOk(['root' => $root, 'nested' => $nested, 'framework' => $fw, 'sqls' => $sqls, 'files' => countFiles($root)]);
 }
 
@@ -624,6 +655,32 @@ function detectFramework(string $dir): string
         return 'modx';
     }
     if (is_dir($dir . '/wa-system') || (is_dir($dir . '/wa-apps') && is_dir($dir . '/wa-config'))) {
+        return 'webasyst';
+    }
+    return 'unknown';
+}
+
+function detectFrameworkFromSql(string $path): string
+{
+    $gz = str_ends_with(strtolower($path), '.gz');
+    $h  = '';
+    if ($gz) {
+        $g = @gzopen($path, 'r');
+        if ($g) { $h = gzread($g, 8192); gzclose($g); }
+    } else {
+        $fp = @fopen($path, 'r');
+        if ($fp) { $h = fread($fp, 8192); fclose($fp); }
+    }
+    if (preg_match('/CREATE TABLE `b_(user|option|iblock|agent)\b/i', $h)) {
+        return 'bitrix';
+    }
+    if (preg_match('/CREATE TABLE `\w*wp_\w+`/i', $h)) {
+        return 'wordpress';
+    }
+    if (preg_match('/CREATE TABLE `modx_(users|site_content)\b/i', $h)) {
+        return 'modx';
+    }
+    if (preg_match('/CREATE TABLE `wa_(auth_user|contact)\b/i', $h)) {
         return 'webasyst';
     }
     return 'unknown';
