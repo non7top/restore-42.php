@@ -1,6 +1,10 @@
 services:
   web:
-    build: .
+    build:
+      context: .
+      args:
+        UID: ${DOCKER_UID:-1001}
+        GID: ${DOCKER_GID:-1001}
     ports:
       - "8080:80"
     volumes:
