@@ -632,8 +632,12 @@ function handleScan(): void
 {
     $nested = singleNestedDir(EXTRACT_DIR);
     $root   = $nested ? EXTRACT_DIR . '/' . $nested : EXTRACT_DIR;
-    $fw     = detectFramework($root);
-    $sqls   = findSqlFiles(EXTRACT_DIR);
+
+    // Auto-extract any inner archives (e.g. outer zip contains site.zip + dump.sql)
+    extractInnerArchives($root);
+
+    $fw   = detectFramework($root);
+    $sqls = findSqlFiles(EXTRACT_DIR);
     // Fall back to SQL-based detection when the extract dir has no framework files
     if ($fw === 'unknown' && !empty($sqls)) {
         $fw = detectFrameworkFromSql($sqls[0]['path']);
@@ -641,9 +645,68 @@ function handleScan(): void
     jsonOk(['root' => $root, 'nested' => $nested, 'framework' => $fw, 'sqls' => $sqls, 'files' => countFiles($root)]);
 }
 
+/**
+ * Extract any archive files found directly inside $dir (one level deep).
+ * Archives are extracted in-place: archive.zip → archive.zip_extracted/
+ * Already-extracted directories are skipped.
+ */
+function extractInnerArchives(string $dir): void
+{
+    if (!is_dir($dir)) {
+        return;
+    }
+    foreach (scandir($dir) as $entry) {
+        if ($entry === '.' || $entry === '..') {
+            continue;
+        }
+        $path = $dir . '/' . $entry;
+        if (!is_file($path)) {
+            continue;
+        }
+        $lo  = strtolower($entry);
+        $dst = $path . '_extracted';
+        if (is_dir($dst)) {
+            continue; // already done
+        }
+        if (preg_match('/\.zip$/', $lo)) {
+            mkdir($dst, 0755, true);
+            $r = extractZip($path, $dst);
+        } elseif (preg_match('/\.(tar\.gz|tgz)$/', $lo)) {
+            mkdir($dst, 0755, true);
+            $r = extractTarGz($path, $dst);
+        } elseif (preg_match('/\.tar$/', $lo)) {
+            mkdir($dst, 0755, true);
+            $r = extractTar($path, $dst);
+        } else {
+            continue;
+        }
+        if (!($r['ok'] ?? false)) {
+            @rmdir($dst); // clean up empty dir on failure
+        }
+    }
+}
+
 // ── Framework detection ───────────────────────────────────────────────────────
 
 function detectFramework(string $dir): string
+{
+    $fw = detectFrameworkDir($dir);
+    if ($fw !== 'unknown') {
+        return $fw;
+    }
+    // Also look inside *_extracted sub-directories (inner archives auto-extracted by scan)
+    foreach (glob($dir . '/*_extracted', GLOB_ONLYDIR) as $sub) {
+        $nested = singleNestedDir($sub);
+        $root   = $nested ? $sub . '/' . $nested : $sub;
+        $fw     = detectFrameworkDir($root);
+        if ($fw !== 'unknown') {
+            return $fw;
+        }
+    }
+    return 'unknown';
+}
+
+function detectFrameworkDir(string $dir): string
 {
     if (is_dir($dir . '/bitrix') && file_exists($dir . '/bitrix/modules/main/include.php')) {
         return 'bitrix';
@@ -681,8 +744,8 @@ function detectFrameworkFromSql(string $path): string
     foreach ($m[1] as $tbl) {
         if (preg_match('/^b_(user|option|iblock|agent|event|file|group|lang|module|task|vote)$/', $tbl)) {
             $scores['bitrix'] += 10;
-        } elseif (preg_match('/^wa_(auth_user|contact|contact_data|app_settings|log|routing|transaction)$/', $tbl)) {
-            $scores['webasyst'] += 10;
+        } elseif (preg_match('/^wa_[a-z]/', $tbl)) {
+            $scores['webasyst'] += 5;
         } elseif (preg_match('/^(modx_users|modx_site_content|modx_site_templates|modx_web_groups)$/', $tbl)) {
             $scores['modx'] += 10;
         } elseif (preg_match('/^\w*wp_(options|posts|users|usermeta|terms|postmeta|comments)$/', $tbl)) {
