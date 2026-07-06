@@ -26,7 +26,14 @@ RUN mkdir -p /var/www/html/.restore/uploads \
     && chown www-data:www-data /var/www/html/restore-42.php \
     && chmod 644 /var/www/html/restore-42.php
 
+# Switch Apache to a non-privileged port so the process never needs root
+RUN sed -i 's/^Listen 80$/Listen 8080/' /etc/apache2/ports.conf \
+    && sed -i 's/<VirtualHost \*:80>/<VirtualHost *:8080>/' /etc/apache2/sites-enabled/000-default.conf
+
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# Run as the remapped www-data — no root process needed
+USER www-data
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["apache2-foreground"]

@@ -6,7 +6,7 @@ services:
         UID: ${DOCKER_UID:-1001}
         GID: ${DOCKER_GID:-1001}
     ports:
-      - "8080:80"
+      - "8080:8080"
     volumes:
       - ./:/var/www/html
     depends_on:
