@@ -1797,11 +1797,17 @@ function createTarGzNative(string $rootDir, string $dest, array $exclude = []): 
 
 function countFiles(string $dir): int
 {
+    $realDir = rtrim(realpath($dir) ?: $dir, '/');
     $n = 0;
     foreach (new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS)) as $f) {
-        if ($f->isFile()) {
-            $n++;
+        if (!$f->isFile()) {
+            continue;
         }
+        // Exclude our own access guard sitting directly in $dir (not real content)
+        if (rtrim($f->getPath(), '/') === $realDir && in_array($f->getFilename(), ['index.php', '.htaccess'], true)) {
+            continue;
+        }
+        $n++;
     }
     return $n;
 }
