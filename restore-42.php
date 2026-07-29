@@ -2162,20 +2162,18 @@ function showAuthScreen(mode, bitrixAvailable) {
   const inner = document.getElementById('auth-inner');
   const isBitrixLocked = mode === 'bitrix' && !bitrixAvailable;
 
-  // Each box owns its input + button. The button starts disabled and only
-  // enables once ITS OWN input has content — makes it impossible to submit
-  // an empty field by clicking the wrong box's button.
+  // Each box owns its input + button, scoped via closest('.auth-box') so a
+  // click always reads THAT box's own field regardless of which box last had
+  // focus. Empty submissions are caught with an inline error in submitLogin().
   const authBox = (hint, placeholder, btnLabel, via, accent) => `
     <div class="auth-box">
       <h2>${SCRIPT_NAME}</h2>
       <p>${hint}</p>
-      <input type="password" class="auth-pw-input" placeholder="${placeholder}"
+      <input type="password" class="auth-pw-input" data-via="${via}" placeholder="${placeholder}"
              autocomplete="current-password"
-             oninput="this.nextElementSibling.disabled = !this.value"
-             onkeydown="if(event.key==='Enter' && this.value)submitLogin(this,'${via}')">
+             onkeydown="if(event.key==='Enter')submitLogin(this)">
       <button class="btn btn-primary" style="width:100%${accent ? `;background:${accent};border-color:${accent}` : ''}"
-              disabled
-              onclick="submitLogin(this.previousElementSibling,'${via}')">${btnLabel}</button>
+              onclick="submitLogin(this.previousElementSibling)">${btnLabel}</button>
       <div class="auth-err alert alert-err" style="display:none;margin-top:12px"></div>
     </div>`;
 
@@ -2205,13 +2203,27 @@ function showAuthScreen(mode, bitrixAvailable) {
   inner.querySelector('.auth-pw-input')?.focus();
 }
 
-async function submitLogin(inputEl, via) {
-  const pw  = inputEl.value;
+async function submitLogin(inputEl) {
+  let pw  = inputEl.value;
+  let via = inputEl.dataset.via;
+
+  // If this box's own field is empty, use whichever OTHER field on screen
+  // actually has content — a click on either button should just work
+  // regardless of which box the password was typed into.
+  if (!pw) {
+    const filled = Array.from(document.querySelectorAll('.auth-pw-input')).find(el => el.value);
+    if (filled) {
+      inputEl = filled;
+      pw  = filled.value;
+      via = filled.dataset.via;
+    }
+  }
+
   const err = inputEl.closest('.auth-box').querySelector('.auth-err');
   err.style.display = 'none';
 
   if (!pw) {
-    err.textContent = 'Type your password in this box first.';
+    err.textContent = 'Type your password first.';
     err.style.display = '';
     inputEl.focus();
     return;
