@@ -12,7 +12,6 @@ define('WORK_DIR', __DIR__ . '/.restore');
 define('UPLOADS_DIR', WORK_DIR . '/uploads');
 define('EXTRACT_DIR', WORK_DIR . '/extract');
 define('BACKUPS_DIR', WORK_DIR . '/backups');
-define('STATE_FILE', WORK_DIR . '/.state');
 define('AUTH_COOKIE', 'r42_auth');
 define('AUTH_TTL', 604800); // 7-day token lifetime
 
@@ -97,12 +96,6 @@ switch ($action) {
         break;
     case 'backup':
         handleBackup();
-        break;
-    case 'get_state':
-        jsonOk(getState());
-        break;
-    case 'set_state':
-        handleSetState();
         break;
     case 'delete_file':
         handleDeleteFile();
@@ -345,30 +338,6 @@ function handleLogout(): void
 {
     authClearCookie();
     jsonOk();
-}
-
-// ── State ────────────────────────────────────────────────────────────────────
-
-function getState(): array
-{
-    if (!file_exists(STATE_FILE)) {
-        return [];
-    }
-    $d = json_decode(file_get_contents(STATE_FILE), true);
-    return is_array($d) ? $d : [];
-}
-
-function saveState(array $s): void
-{
-    file_put_contents(STATE_FILE, json_encode($s, JSON_PRETTY_PRINT));
-}
-
-function handleSetState(): void
-{
-    $in = json_decode(file_get_contents('php://input'), true) ?? [];
-    $s = array_merge(getState(), $in);
-    saveState($s);
-    jsonOk($s);
 }
 
 // ── Upload ────────────────────────────────────────────────────────────────────
