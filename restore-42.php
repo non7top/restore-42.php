@@ -1501,6 +1501,11 @@ function handleBackup(): void
     $db      = $_POST['db_name'] ?? '';
     $port    = (int)($_POST['db_port'] ?? 3306);
     $split   = (int)($_POST['split_mb'] ?? 100);
+    $dbOnly  = !empty($_POST['db_only']);
+
+    if ($dbOnly && !$db) {
+        jsonErr('DB name is required for a DB-only backup');
+    }
 
     $ts   = date('Ymd_His');
     $base = BACKUPS_DIR . '/backup_' . $ts;
@@ -1527,37 +1532,40 @@ function handleBackup(): void
 
     // 2. Files archive — prefer shell tar (faster, supports --exclude);
     //    fall back to PharData for hosts where tar is not available.
-    $archive = $base . '.tar.gz';
-    $excludes = ' --exclude=' . escapeshellarg(basename(WORK_DIR))
-              . ' --exclude=' . escapeshellarg(basename(__FILE__));
-    $tarCmd = "tar -czf " . escapeshellarg($archive) . $excludes .
-              " -C " . escapeshellarg(dirname($rootDir)) . " " . escapeshellarg(basename($rootDir)) . " 2>&1";
-    exec($tarCmd, $o, $ret);
+    //    Skipped entirely for a DB-only backup.
+    if (!$dbOnly) {
+        $archive = $base . '.tar.gz';
+        $excludes = ' --exclude=' . escapeshellarg(basename(WORK_DIR))
+                  . ' --exclude=' . escapeshellarg(basename(__FILE__));
+        $tarCmd = "tar -czf " . escapeshellarg($archive) . $excludes .
+                  " -C " . escapeshellarg(dirname($rootDir)) . " " . escapeshellarg(basename($rootDir)) . " 2>&1";
+        exec($tarCmd, $o, $ret);
 
-    if ($ret !== 0 || !file_exists($archive)) {
-        // shell tar unavailable — use PharData
-        $ret = createTarGzNative($rootDir, $archive, [basename(WORK_DIR), basename(__FILE__)]) ? 0 : 1;
-        $o   = $ret !== 0 ? ['PharData archive creation failed'] : [];
-    }
+        if ($ret !== 0 || !file_exists($archive)) {
+            // shell tar unavailable — use PharData
+            $ret = createTarGzNative($rootDir, $archive, [basename(WORK_DIR), basename(__FILE__)]) ? 0 : 1;
+            $o   = $ret !== 0 ? ['PharData archive creation failed'] : [];
+        }
 
-    if ($ret === 0 && file_exists($archive)) {
-        $sz = filesize($archive);
-        if ($split > 0 && $sz > $split * 1048576) {
-            $splitCmd = "split -b {$split}m " . escapeshellarg($archive) . " " . escapeshellarg($archive . '.') . " 2>&1";
-            exec($splitCmd, $o2, $ret2);
-            if ($ret2 === 0) {
-                unlink($archive);
-                $res[] = "Archive split into {$split}MB parts (Bitrix format)";
+        if ($ret === 0 && file_exists($archive)) {
+            $sz = filesize($archive);
+            if ($split > 0 && $sz > $split * 1048576) {
+                $splitCmd = "split -b {$split}m " . escapeshellarg($archive) . " " . escapeshellarg($archive . '.') . " 2>&1";
+                exec($splitCmd, $o2, $ret2);
+                if ($ret2 === 0) {
+                    unlink($archive);
+                    $res[] = "Archive split into {$split}MB parts (Bitrix format)";
+                } else {
+                    embedFileSha256($archive);
+                    $res[] = "Archive: backup_{$ts}.tar.gz (" . fmtSize($sz) . ")";
+                }
             } else {
                 embedFileSha256($archive);
                 $res[] = "Archive: backup_{$ts}.tar.gz (" . fmtSize($sz) . ")";
             }
         } else {
-            embedFileSha256($archive);
-            $res[] = "Archive: backup_{$ts}.tar.gz (" . fmtSize($sz) . ")";
+            $res[] = "tar failed: " . implode(' ', $o);
         }
-    } else {
-        $res[] = "tar failed: " . implode(' ', $o);
     }
 
     // Collect files, embedding SHA-256 in any split parts
@@ -2086,10 +2094,16 @@ select option{background:#1a1d27}
             <div class="form-group"><label>DB Password</label><input type="password" id="bk-pass"></div>
             <div class="form-group"><label>DB Name</label><input id="bk-db"></div>
           </div>
-          <div class="form-row">
+          <div class="form-row" id="bk-split-row">
             <div class="form-group" style="flex:0 0 160px">
               <label>Split size (MB, 0=no split)</label>
               <input id="bk-split" value="2047">
+            </div>
+            <div class="form-group" style="flex:0 0 auto;align-self:flex-end;padding-bottom:8px">
+              <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+                <input type="checkbox" id="bk-db-only" onchange="document.getElementById('bk-split').disabled = this.checked">
+                DB only (skip file archive)
+              </label>
             </div>
           </div>
           <button class="btn btn-primary" onclick="doBackup()">Create Backup</button>
@@ -2349,6 +2363,12 @@ async function runAutoScan() {
   if (creds.db_user) document.getElementById('db-user').value = creds.db_user;
   if (creds.db_pass) document.getElementById('db-pass').value = creds.db_pass;
   if (creds.db_name) document.getElementById('db-name').value = creds.db_name;
+  // Also pre-fill the Backup tab's DB fields from the same detected credentials
+  if (creds.db_host) document.getElementById('bk-host').value = creds.db_host;
+  if (creds.db_port) document.getElementById('bk-port').value = creds.db_port;
+  if (creds.db_user) document.getElementById('bk-user').value = creds.db_user;
+  if (creds.db_pass) document.getElementById('bk-pass').value = creds.db_pass;
+  if (creds.db_name) document.getElementById('bk-db').value = creds.db_name;
   // Persist to encrypted vault so next session auto-fills
   if (Object.keys(creds).length) vaultSave(creds);
 
@@ -2799,6 +2819,7 @@ async function doBackup() {
     db_pass:  document.getElementById('bk-pass').value,
     db_name:  document.getElementById('bk-db').value,
     split_mb: document.getElementById('bk-split').value,
+    db_only:  document.getElementById('bk-db-only').checked ? '1' : '',
   });
   if (!r.ok) { log.innerHTML += `<div class="log-line log-err">${r.error}</div>`; return; }
   (r.results||[]).forEach(l => log.innerHTML += `<div class="log-line log-ok">${l}</div>`);
