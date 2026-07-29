@@ -27,10 +27,23 @@ foreach ([WORK_DIR, UPLOADS_DIR, EXTRACT_DIR, BACKUPS_DIR] as $d) {
         mkdir($d, 0755, true);
     }
 }
-// Protect work dir from direct web access
+// Protect work dir from direct web access.
+// .htaccess only works under Apache — nginx ignores it entirely and will
+// happily serve or list files in WORK_DIR unless its own config blocks it.
+// index.php guards below are a defense-in-depth fallback: they stop directory
+// listing under both servers (as long as nginx routes .php to PHP-FPM, which
+// is the near-universal default), but do NOT stop a direct request for a
+// specific known filename under nginx — only a server-config rule can do that.
 $htFile = WORK_DIR . '/.htaccess';
 if (!file_exists($htFile)) {
-    file_put_contents($htFile, 'Deny from all');
+    file_put_contents($htFile, "Require all denied\nDeny from all\n");
+}
+$denyPhp = "<?php http_response_code(403); exit('Forbidden');\n";
+foreach ([WORK_DIR, UPLOADS_DIR, EXTRACT_DIR, BACKUPS_DIR] as $d) {
+    $guard = $d . '/index.php';
+    if (!file_exists($guard)) {
+        file_put_contents($guard, $denyPhp);
+    }
 }
 // Clean up chunk files abandoned for more than 1 hour (truly orphaned).
 // Do NOT delete recent chunks — they belong to an upload that is in progress.
@@ -381,7 +394,7 @@ function handleListFiles(): void
 {
     $files = [];
     foreach (glob(UPLOADS_DIR . '/*') ?: [] as $f) {
-        if (!is_file($f) || str_contains(basename($f), '.chunk')) {
+        if (!is_file($f) || str_contains(basename($f), '.chunk') || basename($f) === 'index.php') {
             continue;
         }
         $h = readEmbeddedSha256($f);
@@ -622,6 +635,7 @@ function handleExtract(): void
 
     rmdirRecursive(EXTRACT_DIR);
     mkdir(EXTRACT_DIR, 0755, true);
+    file_put_contents(EXTRACT_DIR . '/index.php', "<?php http_response_code(403); exit('Forbidden');\n");
 
     $n = strtolower($name);
     if (preg_match('/\.zip$/', $n)) {
@@ -769,7 +783,8 @@ function streamCopyBytes(string $src, string $dst, int $length): bool
 
 function singleNestedDir(string $dir): ?string
 {
-    $entries = array_values(array_diff(scandir($dir), ['.', '..']));
+    // Exclude our own directory-listing/access guards, not part of the actual content
+    $entries = array_values(array_diff(scandir($dir), ['.', '..', 'index.php', '.htaccess']));
     if (count($entries) === 1 && is_dir($dir . '/' . $entries[0])) {
         return $entries[0];
     }
@@ -1069,8 +1084,13 @@ function extractTablePrefix(string $dir, string $fw): ?string
 function getServerEnvironment(): array
 {
     $bin = fn(string $cmd) => trim(shell_exec("which {$cmd} 2>/dev/null") ?: '') !== '';
+    $sw  = (string)($_SERVER['SERVER_SOFTWARE'] ?? '');
     return [
-        'php_version' => PHP_VERSION,
+        'php_version'     => PHP_VERSION,
+        'server_software' => $sw ?: 'unknown',
+        // .htaccess-based protection of WORK_DIR only works under Apache —
+        // nginx ignores .htaccess entirely and needs an explicit config rule.
+        'is_nginx'        => str_contains(strtolower($sw), 'nginx'),
         'extensions'  => [
             'pdo_mysql' => extension_loaded('pdo_mysql'),
             'zip'       => extension_loaded('zip'),
@@ -2439,16 +2459,22 @@ async function deriveKey(password, salt) {
 }
 
 async function vaultSave(data) {
-  if (!_sessionKey) return;
-  const enc  = new TextEncoder();
-  const iv   = crypto.getRandomValues(new Uint8Array(12));
-  const ct   = await crypto.subtle.encrypt({name:'AES-GCM', iv}, _sessionKey, enc.encode(JSON.stringify(data)));
-  const salt = _sessionKey._salt; // stashed below
-  localStorage.setItem(VAULT_KEY, JSON.stringify({
-    iv:   btoa(String.fromCharCode(...iv)),
-    ct:   btoa(String.fromCharCode(...new Uint8Array(ct))),
-    salt: btoa(String.fromCharCode(...salt)),
-  }));
+  if (!_sessionKey) return false;
+  try {
+    const enc  = new TextEncoder();
+    const iv   = crypto.getRandomValues(new Uint8Array(12));
+    const ct   = await crypto.subtle.encrypt({name:'AES-GCM', iv}, _sessionKey, enc.encode(JSON.stringify(data)));
+    const salt = _sessionKey._salt; // stashed below
+    localStorage.setItem(VAULT_KEY, JSON.stringify({
+      iv:   btoa(String.fromCharCode(...iv)),
+      ct:   btoa(String.fromCharCode(...new Uint8Array(ct))),
+      salt: btoa(String.fromCharCode(...salt)),
+    }));
+    return true;
+  } catch (e) {
+    console.warn('vaultSave failed:', e);
+    return false;
+  }
 }
 
 async function vaultLoad(password) {
@@ -2538,11 +2564,11 @@ async function runAutoScan() {
   if (creds.db_pass) document.getElementById('bk-pass').value = creds.db_pass;
   if (creds.db_name) document.getElementById('bk-db').value = creds.db_name;
   // Persist to encrypted vault so next session auto-fills
-  if (Object.keys(creds).length) vaultSave(creds);
+  const hasCreds = Object.keys(creds).length > 0;
+  const vaultSaved = hasCreds ? await vaultSave(creds) : false;
 
   const fw = scan.framework || 'unknown';
   const fwColor = FW_COLORS[fw] || '#64748b';
-  const hasCreds = Object.keys(creds).length > 0;
   const hasFiles = (scan.files || 0) > 0;
 
   // Show/hide the Bitrix-specific tools panel
@@ -2601,7 +2627,12 @@ async function runAutoScan() {
 
       ${hasCreds ? `
       <div>
-        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:8px">DB Credentials <span style="color:#22c55e;font-size:10px">(from config file)</span></div>
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:8px;display:flex;align-items:center;gap:8px">
+          DB Credentials <span style="color:#22c55e;font-size:10px;text-transform:none;letter-spacing:normal">(from config file)</span>
+          ${vaultSaved
+            ? `<span title="Encrypted and saved to browser storage — will auto-fill on next login" style="color:#22c55e;font-size:10px;text-transform:none;letter-spacing:normal;font-weight:600">🔒 saved to vault</span>`
+            : `<span title="Not persisted — will need to be re-detected or re-entered next login" style="color:#facc15;font-size:10px;text-transform:none;letter-spacing:normal;font-weight:600">⚠ not saved</span>`}
+        </div>
         <table style="width:100%;border-collapse:collapse;font-size:13px">
           ${credRows.map(([k,v]) => {
             const isPass = k === 'Password';
@@ -2654,11 +2685,21 @@ async function runAutoScan() {
           </div>`).join('')}
       </div>` : ''}
 
+      ${env.is_nginx ? `
+      <div style="background:#facc1522;border:1px solid #facc1544;border-radius:8px;padding:12px 14px">
+        <div style="color:#facc15;font-size:13px;font-weight:600;margin-bottom:6px">⚠ nginx detected — .htaccess does not protect the work directory</div>
+        <p style="font-size:12px;color:#e2e8f0;margin-bottom:8px">This tool's <code>.restore/</code> directory (uploaded backups, extracted files, DB dumps) is normally blocked from direct web access via <code>.htaccess</code>, but nginx ignores that file entirely. Add this to your nginx server block:</p>
+        <pre style="font-size:11px;color:#e2e8f0;background:#0f1117;border-radius:6px;padding:10px;overflow-x:auto;white-space:pre-wrap">location ~ /\.restore/ {
+    deny all;
+    return 404;
+}</pre>
+      </div>` : ''}
+
       <div>
         <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:8px">Server Environment</div>
         <div style="display:flex;flex-wrap:wrap;gap:24px">
           <div>
-            <div style="font-size:12px;color:#94a3b8;margin-bottom:6px">PHP ${escHtml(env.php_version||'?')}</div>
+            <div style="font-size:12px;color:#94a3b8;margin-bottom:6px">PHP ${escHtml(env.php_version||'?')} · ${escHtml(env.server_software||'?')}</div>
             ${extRows.map(([k,ok]) => `<div style="font-size:12px;margin-bottom:2px">${dot(ok)}${escHtml(k)}</div>`).join('')}
           </div>
           <div>
