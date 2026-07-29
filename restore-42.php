@@ -127,7 +127,7 @@ switch ($action) {
 // Sets Secure flag automatically when served over HTTPS.
 
 define('AUTH_COOKIE',  'r42_auth');
-define('AUTH_TTL',     86400);       // 24-hour token lifetime
+define('AUTH_TTL',     604800);      // 7-day token lifetime
 
 function authMakeToken(): string
 {
