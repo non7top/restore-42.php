@@ -92,6 +92,9 @@ switch ($action) {
     case 'scan':
         handleScan();
         break;
+    case 'dir_size':
+        handleDirSize();
+        break;
     case 'test_db':
         handleTestDb();
         break;
@@ -1613,6 +1616,44 @@ function requireExtractDir(string $raw): string
     return $real;
 }
 
+/**
+ * Resolve a user-supplied directory path and verify it is either within
+ * EXTRACT_DIR (an extracted backup) or within this script's own directory
+ * (the live site, when Site Info fell back to scanning it directly).
+ */
+function requireSiteDir(string $raw): string
+{
+    $real = realpath($raw);
+    if (!$real) {
+        jsonErr('Directory not found');
+    }
+    $extractBase = realpath(EXTRACT_DIR);
+    $liveBase    = realpath(__DIR__);
+    $inExtract   = $extractBase && (str_starts_with($real . '/', $extractBase . '/') || $real === $extractBase);
+    $inLive      = $liveBase && (str_starts_with($real . '/', $liveBase . '/') || $real === $liveBase);
+    if (!$inExtract && !$inLive) {
+        jsonErr('Directory not allowed');
+    }
+    return $real;
+}
+
+function dirSize(string $dir): int
+{
+    $size = 0;
+    foreach (new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS)) as $f) {
+        if ($f->isFile()) {
+            $size += $f->getSize();
+        }
+    }
+    return $size;
+}
+
+function handleDirSize(): void
+{
+    $dir = requireSiteDir($_POST['dir'] ?? '');
+    jsonOk(['dir' => $dir, 'size' => dirSize($dir)]);
+}
+
 // ── Cache clearing ────────────────────────────────────────────────────────────
 
 function handleClearCache(): void
@@ -2614,10 +2655,17 @@ async function runAutoScan() {
         <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:6px">Root</div>
         <code style="font-size:11px;color:#94a3b8;word-break:break-all">${scan.root || '—'}</code>
       </div>
-      <div style="display:flex;gap:32px">
+      <div style="display:flex;gap:32px;align-items:flex-end">
         <div>
           <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:4px">Files</div>
           <span style="font-size:13px;color:#e2e8f0">${scan.files?.toLocaleString() || 0}</span>
+        </div>
+        <div>
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:4px">Disk Size</div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <button class="btn btn-secondary btn-sm" id="dir-size-btn" onclick="countDirSize()">📏 Count</button>
+            <span id="dir-size-result" style="font-size:13px;color:#e2e8f0"></span>
+          </div>
         </div>
         ${scan.site_url ? `
         <div>
@@ -2720,6 +2768,17 @@ async function runAutoScan() {
         </div>
       </div>
     </div>`;
+}
+
+async function countDirSize() {
+  const btn = document.getElementById('dir-size-btn');
+  const out = document.getElementById('dir-size-result');
+  if (!fwData.root) return;
+  btn.disabled = true;
+  out.textContent = 'Counting…';
+  const r = await post('dir_size', {dir: fwData.root});
+  btn.disabled = false;
+  out.textContent = r.ok ? fmtSize(r.size) : '✗ ' + r.error;
 }
 
 function siTogglePass() {
