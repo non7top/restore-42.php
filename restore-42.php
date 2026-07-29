@@ -13,6 +13,8 @@ define('UPLOADS_DIR', WORK_DIR . '/uploads');
 define('EXTRACT_DIR', WORK_DIR . '/extract');
 define('BACKUPS_DIR', WORK_DIR . '/backups');
 define('STATE_FILE', WORK_DIR . '/.state');
+define('AUTH_COOKIE', 'r42_auth');
+define('AUTH_TTL', 604800); // 7-day token lifetime
 
 error_reporting(E_ALL);
 ini_set('display_errors', '0');
@@ -131,9 +133,6 @@ switch ($action) {
 // Token: "<expires_unix>.<hmac_sha256(expires|hash, key=hash)>"
 // Bound to STORED_PASS_HASH — re-uploading the script invalidates all tokens.
 // Sets Secure flag automatically when served over HTTPS.
-
-define('AUTH_COOKIE',  'r42_auth');
-define('AUTH_TTL',     604800);      // 7-day token lifetime
 
 /**
  * Return the HMAC signing key for auth tokens.
@@ -2163,59 +2162,42 @@ function showAuthScreen(mode, bitrixAvailable) {
   const inner = document.getElementById('auth-inner');
   const isBitrixLocked = mode === 'bitrix' && !bitrixAvailable;
 
-  // Build form(s)
-  const localBox = (title, hint, btnLabel, via) => `
+  // Each box owns its input + button. The button starts disabled and only
+  // enables once ITS OWN input has content — makes it impossible to submit
+  // an empty field by clicking the wrong box's button.
+  const authBox = (hint, placeholder, btnLabel, via, accent) => `
     <div class="auth-box">
       <h2>${SCRIPT_NAME}</h2>
       <p>${hint}</p>
-      <input type="password" class="auth-pw-input" placeholder="Password"
+      <input type="password" class="auth-pw-input" placeholder="${placeholder}"
              autocomplete="current-password"
-             onkeydown="if(event.key==='Enter')submitLogin(this,'${via}')">
-      <button class="btn btn-primary" style="width:100%"
+             oninput="this.nextElementSibling.disabled = !this.value"
+             onkeydown="if(event.key==='Enter' && this.value)submitLogin(this,'${via}')">
+      <button class="btn btn-primary" style="width:100%${accent ? `;background:${accent};border-color:${accent}` : ''}"
+              disabled
               onclick="submitLogin(this.previousElementSibling,'${via}')">${btnLabel}</button>
       <div class="auth-err alert alert-err" style="display:none;margin-top:12px"></div>
     </div>`;
 
-  const bitrixBox = (hint) => `
-    <div class="auth-box">
-      <h2>${SCRIPT_NAME}</h2>
-      <p>${hint}</p>
-      <input type="password" class="auth-pw-input" placeholder="Bitrix admin password"
-             autocomplete="current-password"
-             onkeydown="if(event.key==='Enter')submitLogin(this,'bitrix')">
-      <button class="btn btn-primary" style="width:100%;background:#f97316;border-color:#f97316"
-              onclick="submitLogin(this.previousElementSibling,'bitrix')">Login with Bitrix</button>
-      <div class="auth-err alert alert-err" style="display:none;margin-top:12px"></div>
-    </div>`;
+  const localBox   = (hint, btnLabel) => authBox(hint, 'Password', btnLabel, 'local', null);
+  const bitrixBox   = (hint) => authBox(hint, 'Bitrix admin password', 'Login with Bitrix', 'bitrix', '#f97316');
 
   let html = '<div style="display:flex;gap:24px;flex-wrap:wrap;justify-content:center">';
 
-  if (mode === 'first_run') {
-    if (bitrixAvailable) {
-      html += bitrixBox('Bitrix detected — use your admin (user #1) password.');
-      html += localBox('Set a local password', 'Or set a separate tool password.', 'Set Password &amp; Login', 'local');
-    } else {
-      html += localBox('First run', 'Set a password to protect this tool.', 'Set Password &amp; Login', 'local');
-    }
+  if (isBitrixLocked) {
+    html += `<div class="auth-box">
+      <h2>${SCRIPT_NAME}</h2>
+      <p style="color:#ef4444">Bitrix auth mode is set but Bitrix is not found at this path.</p>
+      <p style="font-size:12px;color:#64748b">To reset: open the script file and clear the <code>STORED_PASS_HASH</code> constant, then reload.</p>
+    </div>`;
+  } else if (mode === 'first_run') {
+    html += localBox('Set a password to protect this tool.', 'Set Password &amp; Login');
+    if (bitrixAvailable) html += bitrixBox('Or use your Bitrix admin (user #1) password instead.');
   } else if (mode === 'bitrix') {
-    if (isBitrixLocked) {
-      html += `<div class="auth-box">
-        <h2>${SCRIPT_NAME}</h2>
-        <p style="color:#ef4444">Bitrix auth mode is set but Bitrix is not found at this path.</p>
-        <p style="font-size:12px;color:#64748b">To reset: open the script file and clear the <code>STORED_PASS_HASH</code> constant, then reload.</p>
-      </div>`;
-    } else {
-      html += bitrixBox('This tool is linked to Bitrix — use your admin (user #1) password.');
-    }
+    html += bitrixBox('This tool is linked to Bitrix — use your admin (user #1) password.');
   } else {
-    // local mode
-    const hint = bitrixAvailable
-      ? 'Enter your restore password, or use your Bitrix admin password.'
-      : 'Enter your restore password.';
-    html += localBox('Login', hint, 'Login', 'local');
-    if (bitrixAvailable) {
-      html += bitrixBox('Or login directly with your Bitrix admin password.');
-    }
+    html += localBox('Enter your restore password.', 'Login');
+    if (bitrixAvailable) html += bitrixBox('Or login directly with your Bitrix admin password.');
   }
 
   html += '</div>';
@@ -2227,6 +2209,13 @@ async function submitLogin(inputEl, via) {
   const pw  = inputEl.value;
   const err = inputEl.closest('.auth-box').querySelector('.auth-err');
   err.style.display = 'none';
+
+  if (!pw) {
+    err.textContent = 'Type your password in this box first.';
+    err.style.display = '';
+    inputEl.focus();
+    return;
+  }
 
   const r = await post('login', {password: pw, via});
   if (!r.ok) {
