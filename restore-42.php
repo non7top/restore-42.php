@@ -109,8 +109,8 @@ switch ($action) {
     case 'download_upstream':
         handleDownloadUpstream();
         break;
-    case 'create_admin_script':
-        handleCreateAdminScript();
+    case 'bitrix_login':
+        handleBitrixAdminAuth();
         break;
     case 'download_backup':
         handleDownloadBackup();
@@ -808,14 +808,25 @@ function handleScan(): void
     }
 
     $dbCreds = extractDbCredentials($fwRoot, $fw);
+    $siteUrl = extractSiteUrl($fwRoot, $fw);
+    $prefix  = extractTablePrefix($fwRoot, $fw);
+    $bitrixSites = $fw === 'bitrix' ? detectBitrixSites($dbCreds) : [];
+
     jsonOk([
-        'root'           => $root,
-        'nested'         => $nested,
-        'framework'      => $fw,
-        'sqls'           => $sqls,
-        'files'          => countFiles($root),
-        'db_credentials' => $dbCreds,
-        'live_site'      => $liveSite,
+        'root'              => $root,
+        'nested'            => $nested,
+        'framework'         => $fw,
+        'sqls'              => $sqls,
+        'files'             => countFiles($root),
+        'db_credentials'    => $dbCreds,
+        'live_site'         => $liveSite,
+        'site_url'          => $siteUrl,
+        'table_prefix'      => $prefix,
+        'server_env'        => getServerEnvironment(),
+        'disk_free'         => @disk_free_space(WORK_DIR),
+        'backups'           => listBackups(),
+        'bitrix_available'  => detectBitrixPresent(),
+        'bitrix_sites'      => $bitrixSites,
     ]);
 }
 
@@ -1000,6 +1011,147 @@ function extractDbCredentials(string $dir, string $fw): array
             break;
     }
     return $c;
+}
+
+/** Parse the site's base URL from its config file, where available. */
+function extractSiteUrl(string $dir, string $fw): ?string
+{
+    switch ($fw) {
+        case 'wordpress':
+            $src = @file_get_contents($dir . '/wp-config.php');
+            if ($src && preg_match('/define\s*\(\s*[\'"]WP_HOME[\'"]\s*,\s*[\'"]([^\'"]*)[\'"]/', $src, $m)) {
+                return rtrim($m[1], '/');
+            }
+            if ($src && preg_match('/define\s*\(\s*[\'"]WP_SITEURL[\'"]\s*,\s*[\'"]([^\'"]*)[\'"]/', $src, $m)) {
+                return rtrim($m[1], '/');
+            }
+            return null;
+        case 'webasyst':
+            $src = @file_get_contents($dir . '/wa-config/config.php');
+            if ($src && preg_match('/[\'"]url[\'"]\s*=>\s*[\'"]([^\'"]*)[\'"]/', $src, $m)) {
+                return rtrim($m[1], '/');
+            }
+            return null;
+        case 'modx':
+            foreach ([$dir . '/core/config/config.inc.php', $dir . '/manager/includes/config.inc.php'] as $cfg) {
+                $src = @file_get_contents($cfg);
+                if ($src && preg_match('/\$site_url\s*=\s*[\'"]([^\'"]*)[\'"]/', $src, $m)) {
+                    return rtrim($m[1], '/');
+                }
+            }
+            return null;
+        default:
+            // Bitrix stores the site URL in the b_lang/b_option DB tables, not a config file.
+            return null;
+    }
+}
+
+/** Return the table prefix for the detected framework, where it's configurable. */
+function extractTablePrefix(string $dir, string $fw): ?string
+{
+    switch ($fw) {
+        case 'wordpress':
+            $src = @file_get_contents($dir . '/wp-config.php');
+            if ($src && preg_match('/\$table_prefix\s*=\s*[\'"]([^\'"]*)[\'"]/', $src, $m)) {
+                return $m[1];
+            }
+            return 'wp_';
+        case 'bitrix':
+            return 'b_';
+        case 'webasyst':
+            return 'wa_';
+        default:
+            return null;
+    }
+}
+
+/** PHP/server environment relevant to restore operations. */
+function getServerEnvironment(): array
+{
+    $bin = fn(string $cmd) => trim(shell_exec("which {$cmd} 2>/dev/null") ?: '') !== '';
+    return [
+        'php_version' => PHP_VERSION,
+        'extensions'  => [
+            'pdo_mysql' => extension_loaded('pdo_mysql'),
+            'zip'       => extension_loaded('zip'),
+            'mbstring'  => extension_loaded('mbstring'),
+            'phar'      => extension_loaded('phar'),
+        ],
+        'tools' => [
+            'tar'      => $bin('tar'),
+            'unzip'    => $bin('unzip'),
+            'mysql'    => $bin('mysql'),
+            'mysqldump'=> $bin('mysqldump'),
+        ],
+    ];
+}
+
+/**
+ * Bitrix supports multiple sites (domains) sharing one codebase/DB, defined
+ * in the b_lang table with a DOC_ROOT per site. When a site's DOC_ROOT
+ * differs from this script's directory, that's a separate file tree that a
+ * plain backup of __DIR__ would NOT capture — surfaced so the user knows to
+ * back it up too.
+ */
+function detectBitrixSites(array $dbCreds): array
+{
+    if (empty($dbCreds['db_host']) || empty($dbCreds['db_name'])) {
+        return [];
+    }
+    try {
+        $pdo = dbConnect(
+            $dbCreds['db_host'],
+            $dbCreds['db_user'] ?? '',
+            $dbCreds['db_pass'] ?? '',
+            (int)($dbCreds['db_port'] ?? 3306),
+            $dbCreds['db_name']
+        );
+        $rows = $pdo->query("SELECT LID, SERVER_NAME, DOC_ROOT FROM b_lang")->fetchAll(PDO::FETCH_ASSOC);
+        return array_map(fn($r) => [
+            'site_id'    => $r['LID'],
+            'domain'     => $r['SERVER_NAME'],
+            'doc_root'   => $r['DOC_ROOT'],
+            'is_current' => rtrim((string)$r['DOC_ROOT'], '/') === rtrim(__DIR__, '/') || $r['DOC_ROOT'] === '',
+        ], $rows ?: []);
+    } catch (Throwable $e) {
+        return [];
+    }
+}
+
+/**
+ * List backups in BACKUPS_DIR, grouping split multi-part archives
+ * (backup_TS.tar.gz.aa/.ab/... or Bitrix-style .001/.002/...) and their
+ * matching .sql dump into one logical entry per timestamp.
+ */
+function listBackups(): array
+{
+    $groups = [];
+    foreach (glob(BACKUPS_DIR . '/backup_*') ?: [] as $f) {
+        if (!is_file($f)) {
+            continue;
+        }
+        $name = basename($f);
+        if (!preg_match('/^backup_(\d{8}_\d{6})/', $name, $m)) {
+            continue;
+        }
+        $ts = $m[1];
+        $groups[$ts]['files'][] = ['name' => $name, 'size' => filesize($f)];
+        $groups[$ts]['total']    = ($groups[$ts]['total'] ?? 0) + filesize($f);
+        $groups[$ts]['mtime']    = max($groups[$ts]['mtime'] ?? 0, filemtime($f));
+    }
+    $out = [];
+    foreach ($groups as $ts => $g) {
+        usort($g['files'], fn($a, $b) => strcmp($a['name'], $b['name']));
+        $out[] = [
+            'timestamp' => $ts,
+            'files'     => $g['files'],
+            'part_count'=> count($g['files']),
+            'total_size'=> $g['total'],
+            'mtime'     => $g['mtime'],
+        ];
+    }
+    usort($out, fn($a, $b) => $b['mtime'] <=> $a['mtime']);
+    return $out;
 }
 
 function detectFrameworkFromSql(string $path): string
@@ -1737,23 +1889,37 @@ function handleDownloadUpstream(): void
     jsonOk(['file' => $scripts[$key]['file'], 'size' => strlen($body)]);
 }
 
-function handleCreateAdminScript(): void
+/**
+ * Emulate the classic "2.php" emergency-admin-login trick directly, with no
+ * file left on disk. Bootstraps Bitrix's own prolog, authorizes as user #1
+ * (superadmin), then redirects into the admin panel. Reached via a plain
+ * GET navigation (window.open), same as opening 2.php would have been.
+ */
+function handleBitrixAdminAuth(): never
 {
-    $dest = __DIR__ . '/2.php';
-    $code = <<<'PHP'
-<? require($_SERVER["DOCUMENT_ROOT"] . "/bitrix/header.php");
-global $USER;
-$USER->Authorize(1);
-@unlink(__FILE__);
-LocalRedirect("/bitrix/admin/");
-require($_SERVER["DOCUMENT_ROOT"]."/bitrix/footer.php");?>
-
-PHP;
-
-    if (file_put_contents($dest, $code) === false) {
-        jsonErr('Cannot write 2.php — check directory permissions');
+    $docRoot = rtrim($_SERVER['DOCUMENT_ROOT'] ?? '', '/');
+    $header  = $docRoot !== '' ? $docRoot . '/bitrix/header.php' : '';
+    if ($header === '' || !file_exists($header)) {
+        $header = __DIR__ . '/bitrix/header.php'; // fallback if DOCUMENT_ROOT is unreliable
     }
-    jsonOk(['file' => '2.php']);
+    if (!file_exists($header)) {
+        http_response_code(500);
+        header('Content-Type: text/plain');
+        echo "bitrix/header.php not found — this script is not sitting inside a Bitrix site root.";
+        exit;
+    }
+    define('NO_KEEP_STATISTIC', true);
+    define('NOT_CHECK_PERMISSIONS', true);
+    ob_start();
+    require $header;
+    ob_end_clean();
+    global $USER;
+    $USER->Authorize(1);
+    if (function_exists('LocalRedirect')) {
+        LocalRedirect('/bitrix/admin/');
+    }
+    header('Location: /bitrix/admin/');
+    exit;
 }
 
 // ── HTML / UI ─────────────────────────────────────────────────────────────────
@@ -1868,17 +2034,14 @@ select option{background:#1a1d27}
   <div class="sidebar">
     <div class="sidebar-logo">restore<span>.php</span></div>
     <div class="nav">
-      <div class="nav-item active" onclick="showTab('restore')" id="tab-restore">
-        <span class="icon">🔄</span> Restore
-      </div>
-      <div class="nav-item" onclick="showTab('siteinfo')" id="tab-siteinfo">
+      <div class="nav-item active" onclick="showTab('siteinfo')" id="tab-siteinfo">
         <span class="icon">🔍</span> Site Info
+      </div>
+      <div class="nav-item" onclick="showTab('restore')" id="tab-restore">
+        <span class="icon">🔄</span> Restore
       </div>
       <div class="nav-item" onclick="showTab('backup')" id="tab-backup">
         <span class="icon">📦</span> Backup
-      </div>
-      <div class="nav-item" onclick="showTab('bitrix')" id="tab-bitrix">
-        <span class="icon">🔧</span> Bitrix Tools
       </div>
     </div>
     <div style="padding:16px 20px;border-top:1px solid #2d3148">
@@ -2063,7 +2226,7 @@ select option{background:#1a1d27}
       </div><!-- /pane-restore -->
 
       <!-- ── SITE INFO TAB ─────────────────────────────────────── -->
-      <div id="pane-siteinfo" style="display:none">
+      <div id="pane-siteinfo">
         <div class="panel">
           <div class="panel-title" style="display:flex;align-items:center;justify-content:space-between">
             Site Info
@@ -2071,6 +2234,27 @@ select option{background:#1a1d27}
           </div>
           <div id="siteinfo-body">
             <p style="color:#64748b;font-size:13px">Scanning…</p>
+          </div>
+        </div>
+
+        <!-- Shown only when the detected framework is Bitrix -->
+        <div class="panel" id="bitrix-tools-panel" style="display:none">
+          <div class="panel-title">Bitrix Tools</div>
+
+          <div style="margin-bottom:20px">
+            <div style="font-size:13px;font-weight:600;color:#e2e8f0;margin-bottom:6px">Official Bitrix scripts</div>
+            <p style="color:#94a3b8;font-size:13px;margin-bottom:12px">Fetch from 1c-bitrix.ru and save to this directory.</p>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+              <button class="btn btn-secondary" onclick="doGetUpstream('restore')">⬇ restore.php</button>
+              <button class="btn btn-secondary" onclick="doGetUpstream('bitrixsetup')">⬇ bitrixsetup.php</button>
+              <span id="upstream-result" style="font-size:13px;color:#94a3b8"></span>
+            </div>
+          </div>
+
+          <div>
+            <div style="font-size:13px;font-weight:600;color:#e2e8f0;margin-bottom:6px">Emergency admin login</div>
+            <p style="color:#94a3b8;font-size:13px;margin-bottom:12px">Opens a Bitrix session as superadmin (user ID&nbsp;1) and redirects into the admin panel — no file is written to disk.</p>
+            <a class="btn btn-primary" href="<?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?>?action=bitrix_login" target="_blank" rel="noopener">Login as Admin</a>
           </div>
         </div>
       </div><!-- /pane-siteinfo -->
@@ -2111,30 +2295,6 @@ select option{background:#1a1d27}
           <div id="backup-files" style="margin-top:12px"></div>
         </div>
       </div>
-
-      <!-- ── BITRIX TOOLS TAB ──────────────────────────────── -->
-      <div id="pane-bitrix" style="display:none">
-
-        <div class="panel">
-          <div class="panel-title">Official Bitrix scripts</div>
-          <p style="color:#94a3b8;font-size:13px;margin-bottom:12px">Fetch from 1c-bitrix.ru and save to this directory.</p>
-          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-            <button class="btn btn-secondary" onclick="doGetUpstream('restore')">⬇ restore.php</button>
-            <button class="btn btn-secondary" onclick="doGetUpstream('bitrixsetup')">⬇ bitrixsetup.php</button>
-            <span id="upstream-result" style="font-size:13px;color:#94a3b8"></span>
-          </div>
-        </div>
-
-        <div class="panel">
-          <div class="panel-title">Emergency admin login</div>
-          <p style="color:#94a3b8;font-size:13px;margin-bottom:12px">Generates <code>2.php</code> next to this file — opens a Bitrix session as superadmin (user ID&nbsp;1) and redirects to the admin panel. <strong style="color:#fca5a5">Delete after use.</strong></p>
-          <div style="display:flex;gap:8px;align-items:center">
-            <button class="btn btn-primary" onclick="doCreateAdminScript()">Create 2.php &amp; open</button>
-            <span id="admin-script-result" style="font-size:13px;color:#94a3b8"></span>
-          </div>
-        </div>
-
-      </div><!-- /pane-bitrix -->
 
     </div><!-- /content -->
   </div><!-- /main -->
@@ -2240,14 +2400,22 @@ async function submitLogin(inputEl) {
     err.style.display = '';
     return;
   }
-  // Init vault with the password used
-  const existing = localStorage.getItem(VAULT_KEY);
-  if (existing) {
-    const saved = await vaultLoad(pw);
-    if (saved) vaultApplyToForms(saved);
-    else await vaultInit(pw);
-  } else {
-    await vaultInit(pw);
+  // Init vault with the password used — best-effort; WebCrypto requires a
+  // secure context (HTTPS/localhost), so this is unavailable over plain HTTP.
+  // Login must still succeed either way.
+  if (window.crypto?.subtle) {
+    try {
+      const existing = localStorage.getItem(VAULT_KEY);
+      if (existing) {
+        const saved = await vaultLoad(pw);
+        if (saved) vaultApplyToForms(saved);
+        else await vaultInit(pw);
+      } else {
+        await vaultInit(pw);
+      }
+    } catch (e) {
+      console.warn('Credential vault unavailable:', e);
+    }
   }
   showApp();
 }
@@ -2324,7 +2492,7 @@ async function showApp() {
   document.getElementById('auth-screen').style.display = 'none';
   document.getElementById('main-app').style.display = '';
   renderStepsNav();
-  showTab('restore');
+  showTab('siteinfo');
   await loadFileList();
   runAutoScan(); // fire-and-forget; populates Site Info pane
 }
@@ -2377,6 +2545,10 @@ async function runAutoScan() {
   const hasCreds = Object.keys(creds).length > 0;
   const hasFiles = (scan.files || 0) > 0;
 
+  // Show/hide the Bitrix-specific tools panel
+  const bitrixPanel = document.getElementById('bitrix-tools-panel');
+  if (bitrixPanel) bitrixPanel.style.display = (fw === 'bitrix') ? '' : 'none';
+
   const credRows = hasCreds ? [
     ['Host',     creds.db_host || '—'],
     ['Port',     creds.db_port || 3306],
@@ -2384,6 +2556,16 @@ async function runAutoScan() {
     ['User',     creds.db_user || '—'],
     ['Password', creds.db_pass || ''],
   ] : [];
+
+  const env = scan.server_env || {};
+  const extRows = Object.entries(env.extensions || {});
+  const toolRows = Object.entries(env.tools || {});
+  const dot = (ok) => `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${ok ? '#22c55e' : '#ef4444'};margin-right:6px"></span>`;
+
+  const bitrixSites = scan.bitrix_sites || [];
+  const externalSites = bitrixSites.filter(s => !s.is_current);
+
+  const backups = scan.backups || [];
 
   body.innerHTML = `
     <div style="display:flex;flex-direction:column;gap:16px">
@@ -2400,9 +2582,21 @@ async function runAutoScan() {
         <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:6px">Root</div>
         <code style="font-size:11px;color:#94a3b8;word-break:break-all">${scan.root || '—'}</code>
       </div>
-      <div>
-        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:4px">Files</div>
-        <span style="font-size:13px;color:#e2e8f0">${scan.files?.toLocaleString() || 0}</span>
+      <div style="display:flex;gap:32px">
+        <div>
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:4px">Files</div>
+          <span style="font-size:13px;color:#e2e8f0">${scan.files?.toLocaleString() || 0}</span>
+        </div>
+        ${scan.site_url ? `
+        <div>
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:4px">Site URL</div>
+          <a href="${escHtml(scan.site_url)}" target="_blank" style="font-size:13px">${escHtml(scan.site_url)}</a>
+        </div>` : ''}
+        ${scan.table_prefix ? `
+        <div>
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:4px">Table Prefix</div>
+          <code style="font-size:13px;color:#e2e8f0">${escHtml(scan.table_prefix)}</code>
+        </div>` : ''}
       </div>` : ''}
 
       ${hasCreds ? `
@@ -2423,6 +2617,20 @@ async function runAutoScan() {
         </table>
       </div>` : hasFiles ? `<div style="color:#64748b;font-size:13px">No DB credentials found in config files.</div>` : ''}
 
+      ${bitrixSites.length ? `
+      <div>
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:8px">Bitrix Sites (multi-site)</div>
+        ${externalSites.length ? `<div style="color:#facc15;font-size:12px;margin-bottom:8px">⚠ ${externalSites.length} site(s) have a separate document root — back those up independently.</div>` : ''}
+        <table style="width:100%;border-collapse:collapse;font-size:13px">
+          ${bitrixSites.map(s => `
+            <tr>
+              <td style="color:#64748b;padding:4px 8px 4px 0;width:40px">${escHtml(s.site_id||'')}</td>
+              <td style="padding:4px 8px 4px 0;color:#e2e8f0">${escHtml(s.domain||'—')}</td>
+              <td style="padding:4px 0;font-family:monospace;font-size:11px;color:${s.is_current ? '#64748b' : '#facc15'}">${escHtml(s.doc_root||'(same as current)')}</td>
+            </tr>`).join('')}
+        </table>
+      </div>` : ''}
+
       ${(scan.sqls||[]).filter(s=>s.is_dump).length ? `
       <div>
         <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:6px">SQL Dumps</div>
@@ -2433,6 +2641,37 @@ async function runAutoScan() {
             <span style="font-size:11px;color:#64748b">${fmtSize(s.size)}</span>
           </div>`).join('')}
       </div>` : ''}
+
+      ${backups.length ? `
+      <div>
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:6px">Existing Backups</div>
+        ${backups.map(b => `
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">
+            <span style="font-size:12px">📦</span>
+            <span style="font-size:13px;color:#e2e8f0">${escHtml(b.timestamp)}</span>
+            <span style="font-size:11px;color:#64748b">${b.part_count > 1 ? b.part_count + ' parts, ' : ''}${fmtSize(b.total_size)}</span>
+            ${b.files.map(f => `<a href="${API('download_backup')}&file=${encodeURIComponent(f.name)}" style="font-size:11px" download>⬇ ${escHtml(f.name)}</a>`).join('')}
+          </div>`).join('')}
+      </div>` : ''}
+
+      <div>
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:8px">Server Environment</div>
+        <div style="display:flex;flex-wrap:wrap;gap:24px">
+          <div>
+            <div style="font-size:12px;color:#94a3b8;margin-bottom:6px">PHP ${escHtml(env.php_version||'?')}</div>
+            ${extRows.map(([k,ok]) => `<div style="font-size:12px;margin-bottom:2px">${dot(ok)}${escHtml(k)}</div>`).join('')}
+          </div>
+          <div>
+            <div style="font-size:12px;color:#94a3b8;margin-bottom:6px">Shell tools</div>
+            ${toolRows.map(([k,ok]) => `<div style="font-size:12px;margin-bottom:2px">${dot(ok)}${escHtml(k)}</div>`).join('')}
+          </div>
+          ${scan.disk_free != null ? `
+          <div>
+            <div style="font-size:12px;color:#94a3b8;margin-bottom:6px">Disk free</div>
+            <div style="font-size:13px;color:#e2e8f0">${fmtSize(scan.disk_free)}</div>
+          </div>` : ''}
+        </div>
+      </div>
     </div>`;
 }
 
@@ -2459,11 +2698,11 @@ function escHtml(s) {
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 
 function showTab(tab) {
-  ['restore','siteinfo','backup','bitrix'].forEach(t => {
+  ['restore','siteinfo','backup'].forEach(t => {
     document.getElementById('pane-' + t).style.display = t === tab ? '' : 'none';
     document.getElementById('tab-' + t).classList.toggle('active', t === tab);
   });
-  const titles = {restore: 'Restore Wizard', siteinfo: 'Site Info', backup: 'Create Backup', bitrix: 'Bitrix Tools'};
+  const titles = {restore: 'Restore Wizard', siteinfo: 'Site Info', backup: 'Create Backup'};
   document.getElementById('topbar-title').textContent = titles[tab] || tab;
 }
 
@@ -2833,18 +3072,6 @@ async function doBackup() {
      <a href="${API('download_backup')}&file=${encodeURIComponent(f.name)}" class="btn btn-secondary btn-sm" download>⬇️</a>
     </div>`
   ).join('');
-}
-
-// ── Bitrix tools ──────────────────────────────────────────────────────────────
-
-async function doCreateAdminScript() {
-  const out = document.getElementById('admin-script-result');
-  out.textContent = 'Creating…';
-  const r = await post('create_admin_script', {});
-  if (!r.ok) { out.textContent = '✗ ' + r.error; return; }
-  const path = location.pathname.replace(/\/[^/]*$/, '/') + r.file;
-  out.innerHTML = `✓ Created — <a href="${path}" target="_blank">${r.file}</a>`;
-  window.open(path, '_blank');
 }
 
 // ── Upstream scripts ─────────────────────────────────────────────────────────
