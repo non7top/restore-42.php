@@ -124,6 +124,10 @@ switch ($action) {
 
 function isAuth(): bool
 {
+    // If the script was re-uploaded, STORED_PASS_HASH is '' — no session is valid.
+    if (STORED_PASS_HASH === '') {
+        return false;
+    }
     return !empty($_SESSION['ra']);
 }
 
