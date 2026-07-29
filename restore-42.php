@@ -1084,6 +1084,16 @@ function extractTablePrefix(string $dir, string $fw): ?string
 }
 
 /** PHP/server environment relevant to restore operations. */
+/** True if $name is a real, callable function — not just loaded, but not blocked by disable_functions either. */
+function phpFunctionAvailable(string $name): bool
+{
+    static $disabled = null;
+    if ($disabled === null) {
+        $disabled = array_map('trim', explode(',', (string)ini_get('disable_functions')));
+    }
+    return function_exists($name) && !in_array($name, $disabled, true);
+}
+
 function getServerEnvironment(): array
 {
     $bin = fn(string $cmd) => trim(shell_exec("which {$cmd} 2>/dev/null") ?: '') !== '';
@@ -1099,6 +1109,17 @@ function getServerEnvironment(): array
             'zip'       => extension_loaded('zip'),
             'mbstring'  => extension_loaded('mbstring'),
             'phar'      => extension_loaded('phar'),
+        ],
+        // exec()/shell_exec() etc. back the tar/mysqldump/mysql CLI paths —
+        // hosts often disable these via php.ini's disable_functions, in which
+        // case only the PharData/PDO fallbacks work.
+        'functions' => [
+            'exec'       => phpFunctionAvailable('exec'),
+            'shell_exec' => phpFunctionAvailable('shell_exec'),
+            'system'     => phpFunctionAvailable('system'),
+            'passthru'   => phpFunctionAvailable('passthru'),
+            'proc_open'  => phpFunctionAvailable('proc_open'),
+            'popen'      => phpFunctionAvailable('popen'),
         ],
         'tools' => [
             'tar'      => $bin('tar'),
@@ -2101,8 +2122,11 @@ select option{background:#1a1d27}
   <div class="sidebar">
     <div class="sidebar-logo">restore<span>.php</span></div>
     <div class="nav">
-      <div class="nav-item active" onclick="showTab('siteinfo')" id="tab-siteinfo">
-        <span class="icon">🔍</span> Site Info
+      <div class="nav-item active" onclick="showTab('frameworkinfo')" id="tab-frameworkinfo">
+        <span class="icon">🔍</span> Framework Info
+      </div>
+      <div class="nav-item" onclick="showTab('serverinfo')" id="tab-serverinfo">
+        <span class="icon">🖥️</span> Server Info
       </div>
       <div class="nav-item" onclick="showTab('restore')" id="tab-restore">
         <span class="icon">🔄</span> Restore
@@ -2292,14 +2316,14 @@ select option{background:#1a1d27}
 
       </div><!-- /pane-restore -->
 
-      <!-- ── SITE INFO TAB ─────────────────────────────────────── -->
-      <div id="pane-siteinfo">
+      <!-- ── FRAMEWORK INFO TAB ────────────────────────────────── -->
+      <div id="pane-frameworkinfo">
         <div class="panel">
           <div class="panel-title" style="display:flex;align-items:center;justify-content:space-between">
-            Site Info
+            Framework Info
             <button class="btn btn-secondary btn-sm" onclick="runAutoScan()">↻ Rescan</button>
           </div>
-          <div id="siteinfo-body">
+          <div id="frameworkinfo-body">
             <p style="color:#64748b;font-size:13px">Scanning…</p>
           </div>
         </div>
@@ -2324,7 +2348,20 @@ select option{background:#1a1d27}
             <a class="btn btn-primary" href="<?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?>?action=bitrix_login" target="_blank" rel="noopener">Login as Admin</a>
           </div>
         </div>
-      </div><!-- /pane-siteinfo -->
+      </div><!-- /pane-frameworkinfo -->
+
+      <!-- ── SERVER INFO TAB ───────────────────────────────────── -->
+      <div id="pane-serverinfo" style="display:none">
+        <div class="panel">
+          <div class="panel-title" style="display:flex;align-items:center;justify-content:space-between">
+            Server Info
+            <button class="btn btn-secondary btn-sm" onclick="runAutoScan()">↻ Rescan</button>
+          </div>
+          <div id="serverinfo-body">
+            <p style="color:#64748b;font-size:13px">Scanning…</p>
+          </div>
+        </div>
+      </div><!-- /pane-serverinfo -->
 
       <!-- ── BACKUP TAB ──────────────────────────────────────────── -->
       <div id="pane-backup" style="display:none">
@@ -2496,9 +2533,19 @@ document.addEventListener('keydown', e => {
 const VAULT_KEY = 'r42_vault';
 let _sessionKey = null; // CryptoKey — held in memory, never written to storage
 
-async function deriveKey(password, salt) {
+async function domainHash() {
   const enc = new TextEncoder();
-  const base = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveKey']);
+  const buf = await crypto.subtle.digest('SHA-256', enc.encode(location.hostname));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Binds the derived key to both the login password AND the current domain
+// (via a SHA-256 hash of location.hostname) — a vault saved on one site's
+// origin can't be decrypted even with the same password on a different site.
+async function deriveKey(password, salt) {
+  const enc  = new TextEncoder();
+  const dHash = await domainHash();
+  const base = await crypto.subtle.importKey('raw', enc.encode(password + '|' + dHash), 'PBKDF2', false, ['deriveKey']);
   return crypto.subtle.deriveKey(
     {name: 'PBKDF2', salt, iterations: 200_000, hash: 'SHA-256'},
     base, {name: 'AES-GCM', length: 256}, false, ['encrypt', 'decrypt']
@@ -2565,9 +2612,9 @@ async function showApp() {
   document.getElementById('auth-screen').style.display = 'none';
   document.getElementById('main-app').style.display = '';
   renderStepsNav();
-  showTab('siteinfo');
+  showTab('frameworkinfo');
   await loadFileList();
-  runAutoScan(); // fire-and-forget; populates Site Info pane
+  runAutoScan(); // fire-and-forget; populates Framework/Server Info panes
 }
 
 // ── Site Info (auto-scan) ─────────────────────────────────────────────────────
@@ -2578,15 +2625,18 @@ const FW_COLORS = {
 };
 
 async function runAutoScan() {
-  const body = document.getElementById('siteinfo-body');
-  if (!body) return;
-  body.innerHTML = '<p style="color:#64748b;font-size:13px">Scanning…</p>';
+  const fwBody = document.getElementById('frameworkinfo-body');
+  const svBody = document.getElementById('serverinfo-body');
+  if (!fwBody || !svBody) return;
+  fwBody.innerHTML = '<p style="color:#64748b;font-size:13px">Scanning…</p>';
+  svBody.innerHTML = '<p style="color:#64748b;font-size:13px">Scanning…</p>';
 
   let scan;
   try {
     scan = await fetch(API('scan')).then(r => r.json());
   } catch(e) {
-    body.innerHTML = '<p style="color:#ef4444;font-size:13px">Scan failed: ' + e.message + '</p>';
+    fwBody.innerHTML = '<p style="color:#ef4444;font-size:13px">Scan failed: ' + e.message + '</p>';
+    svBody.innerHTML = '<p style="color:#ef4444;font-size:13px">Scan failed: ' + e.message + '</p>';
     return;
   }
 
@@ -2640,7 +2690,7 @@ async function runAutoScan() {
 
   const backups = scan.backups || [];
 
-  body.innerHTML = `
+  fwBody.innerHTML = `
     <div style="display:flex;flex-direction:column;gap:16px">
       <div>
         <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:6px">Framework</div>
@@ -2685,7 +2735,7 @@ async function runAutoScan() {
           DB Credentials <span style="color:#22c55e;font-size:10px;text-transform:none;letter-spacing:normal">(from config file)</span>
           ${vaultSaved
             ? `<span title="Encrypted and saved to browser storage — will auto-fill on next login" style="color:#22c55e;font-size:10px;text-transform:none;letter-spacing:normal;font-weight:600">🔒 saved to vault</span>`
-            : `<span title="Not persisted — will need to be re-detected or re-entered next login" style="color:#facc15;font-size:10px;text-transform:none;letter-spacing:normal;font-weight:600">⚠ not saved</span>`}
+            : `<span title="Not persisted this page load — the vault key is only derived right after typing your password at login. Rescan after a fresh login, or use Unlock Vault." style="color:#facc15;font-size:10px;text-transform:none;letter-spacing:normal;font-weight:600">⚠ not saved <button onclick="unlockVault()" style="background:none;border:none;cursor:pointer;color:#facc15;text-decoration:underline;font-size:10px;padding:0">unlock</button></span>`}
         </div>
         <table style="width:100%;border-collapse:collapse;font-size:13px">
           ${credRows.map(([k,v]) => {
@@ -2738,7 +2788,12 @@ async function runAutoScan() {
             ${b.files.map(f => `<a href="${API('download_backup')}&file=${encodeURIComponent(f.name)}" style="font-size:11px" download>⬇ ${escHtml(f.name)}</a>`).join('')}
           </div>`).join('')}
       </div>` : ''}
+    </div>`;
 
+  const fnRows = Object.entries(env.functions || {});
+
+  svBody.innerHTML = `
+    <div style="display:flex;flex-direction:column;gap:16px">
       ${env.is_nginx ? `
       <div style="background:#facc1522;border:1px solid #facc1544;border-radius:8px;padding:12px 14px">
         <div style="color:#facc15;font-size:13px;font-weight:600;margin-bottom:6px">⚠ nginx detected — .htaccess does not protect the work directory</div>
@@ -2750,24 +2805,52 @@ async function runAutoScan() {
       </div>` : ''}
 
       <div>
-        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:8px">Server Environment</div>
-        <div style="display:flex;flex-wrap:wrap;gap:24px">
-          <div>
-            <div style="font-size:12px;color:#94a3b8;margin-bottom:6px">PHP ${escHtml(env.php_version||'?')} · ${escHtml(env.server_software||'?')}</div>
-            ${extRows.map(([k,ok]) => `<div style="font-size:12px;margin-bottom:2px">${dot(ok)}${escHtml(k)}</div>`).join('')}
-          </div>
-          <div>
-            <div style="font-size:12px;color:#94a3b8;margin-bottom:6px">Shell tools</div>
-            ${toolRows.map(([k,ok]) => `<div style="font-size:12px;margin-bottom:2px">${dot(ok)}${escHtml(k)}</div>`).join('')}
-          </div>
-          ${scan.disk_free != null ? `
-          <div>
-            <div style="font-size:12px;color:#94a3b8;margin-bottom:6px">Disk free</div>
-            <div style="font-size:13px;color:#e2e8f0">${fmtSize(scan.disk_free)}</div>
-          </div>` : ''}
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:4px">PHP</div>
+        <div style="font-size:13px;color:#e2e8f0">${escHtml(env.php_version||'?')} · ${escHtml(env.server_software||'?')}</div>
+      </div>
+
+      <div style="display:flex;flex-wrap:wrap;gap:24px">
+        <div>
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:6px">Extensions</div>
+          ${extRows.map(([k,ok]) => `<div style="font-size:12px;margin-bottom:2px">${dot(ok)}${escHtml(k)}</div>`).join('')}
         </div>
+        <div>
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:6px">PHP Functions</div>
+          ${fnRows.map(([k,ok]) => `<div style="font-size:12px;margin-bottom:2px">${dot(ok)}${escHtml(k)}</div>`).join('')}
+        </div>
+        <div>
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:6px">Shell tools</div>
+          ${toolRows.map(([k,ok]) => `<div style="font-size:12px;margin-bottom:2px">${dot(ok)}${escHtml(k)}</div>`).join('')}
+        </div>
+        ${scan.disk_free != null ? `
+        <div>
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:6px">Disk free</div>
+          <div style="font-size:13px;color:#e2e8f0">${fmtSize(scan.disk_free)}</div>
+        </div>` : ''}
       </div>
     </div>`;
+}
+
+async function unlockVault() {
+  const pw = prompt('Re-enter your restore password to unlock the credential vault for this session:');
+  if (!pw) return;
+  if (!window.crypto?.subtle) {
+    alert('WebCrypto is unavailable in this context (requires HTTPS) — the vault cannot be used here.');
+    return;
+  }
+  const existing = localStorage.getItem(VAULT_KEY);
+  if (existing) {
+    const saved = await vaultLoad(pw);
+    if (!saved) {
+      // Wrong password, or vault was saved under a different domain/salt — reinit fresh
+      await vaultInit(pw);
+    } else {
+      vaultApplyToForms(saved);
+    }
+  } else {
+    await vaultInit(pw);
+  }
+  runAutoScan();
 }
 
 async function countDirSize() {
@@ -2804,11 +2887,11 @@ function escHtml(s) {
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 
 function showTab(tab) {
-  ['restore','siteinfo','backup'].forEach(t => {
+  ['restore','frameworkinfo','serverinfo','backup'].forEach(t => {
     document.getElementById('pane-' + t).style.display = t === tab ? '' : 'none';
     document.getElementById('tab-' + t).classList.toggle('active', t === tab);
   });
-  const titles = {restore: 'Restore Wizard', siteinfo: 'Site Info', backup: 'Create Backup'};
+  const titles = {restore: 'Restore Wizard', frameworkinfo: 'Framework Info', serverinfo: 'Server Info', backup: 'Create Backup'};
   document.getElementById('topbar-title').textContent = titles[tab] || tab;
 }
 
