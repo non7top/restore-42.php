@@ -19,6 +19,7 @@ ini_set('display_errors', '0');
 set_time_limit(0);
 ini_set('memory_limit', '512M');
 
+session_set_cookie_params(['samesite' => 'Strict', 'httponly' => true]);
 session_start();
 
 foreach ([WORK_DIR, UPLOADS_DIR, EXTRACT_DIR, BACKUPS_DIR] as $d) {
@@ -145,15 +146,18 @@ function handleLogin(): void
         }
         $newHash = password_hash($pw, PASSWORD_BCRYPT);
         $written = selfEmbedHash($newHash);
+        session_regenerate_id(true);
         $_SESSION['ra'] = true;
         jsonOk(['first_run' => true, 'self_written' => $written,
                 'warn' => $written ? null : 'Could not write password into script file — make it writable by the web server (chmod 644).']);
     }
 
     if (password_verify($pw, $hash)) {
+        session_regenerate_id(true);
         $_SESSION['ra'] = true;
         jsonOk(['first_run' => false]);
     }
+    sleep(1); // slow brute-force on wrong password
     jsonErr('Invalid password');
 }
 
@@ -286,6 +290,17 @@ function handleDeleteFile(): void
         unlink($path);
     }
     jsonOk();
+}
+
+function handleVerifyFile(): void
+{
+    $name = basename($_POST['file'] ?? '');
+    $path = realpath(UPLOADS_DIR . '/' . $name);
+    if (!$path || !str_starts_with($path, realpath(UPLOADS_DIR) . '/')) {
+        jsonErr('Invalid file');
+    }
+    $ok = verifyFileSha256($path);
+    jsonOk(['file' => $name, 'verified' => $ok]);
 }
 
 function detectUploadType(string $path): string
@@ -519,13 +534,23 @@ function extractZip(string $src, string $dst): array
             }
         }
         if ($needsConv) {
+            $realDst = realpath($dst);
             for ($i = 0; $i < $z->numFiles; $i++) {
                 $raw  = $z->getNameIndex($i, ZipArchive::FL_ENC_RAW);
                 $name = mb_convert_encoding($raw, 'UTF-8', 'CP866');
                 if (!mb_check_encoding($name, 'UTF-8')) {
                     $name = mb_convert_encoding($raw, 'UTF-8', 'CP1251');
                 }
-                $out = $dst . '/' . $name;
+                // Resolve path traversal sequences without filesystem calls
+                $segments = [];
+                foreach (explode('/', str_replace('\\', '/', $name)) as $seg) {
+                    if ($seg === '' || $seg === '.') continue;
+                    if ($seg === '..') { array_pop($segments); continue; }
+                    $segments[] = $seg;
+                }
+                $out = $realDst . '/' . implode('/', $segments);
+                // Must remain within $dst
+                if (!str_starts_with($out, $realDst . '/')) continue;
                 if (str_ends_with($name, '/')) {
                     @mkdir($out, 0755, true);
                 } else {
@@ -966,7 +991,11 @@ function sqlScore(string $path, string $name): int
 function dbConnect(string $host, string $user, string $pass, int $port, string $db = ''): PDO
 {
     $dsn = "mysql:host={$host};port={$port};charset=utf8mb4" . ($db ? ";dbname={$db}" : '');
-    return new PDO($dsn, $user, $pass, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_TIMEOUT => 5]);
+    return new PDO($dsn, $user, $pass, [
+        PDO::ATTR_ERRMODE              => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_TIMEOUT              => 5,
+        PDO::MYSQL_ATTR_MULTI_STATEMENTS => false,
+    ]);
 }
 
 function handleTestDb(): void
@@ -982,7 +1011,8 @@ function handleTestDb(): void
         $ver = $pdo->query('SELECT VERSION()')->fetchColumn();
         jsonOk(['version' => $ver]);
     } catch (Throwable $e) {
-        jsonErr($e->getMessage());
+        error_log('restore-42.php DB connect error: ' . $e->getMessage());
+        jsonErr('Connection failed — check host, port, credentials and firewall');
     }
 }
 
@@ -1003,6 +1033,10 @@ function handleImportSql(): void
     $pass = $_POST['db_pass'] ?? '';
     $db   = $_POST['db_name'] ?? '';
     $port = (int)($_POST['db_port'] ?? 3306);
+
+    if ($db && !preg_match('/^[a-zA-Z0-9_\-]+$/', $db)) {
+        jsonErr('Invalid database name — only letters, digits, underscores, and hyphens are allowed');
+    }
 
     try {
         $pdo = dbConnect($host, $user, $pass, $port);
@@ -1088,10 +1122,7 @@ function importViaPdo(PDO $pdo, string $file): void
 function handleUpdateConfig(): void
 {
     $fw      = $_POST['framework'] ?? '';
-    $rootDir = realpath($_POST['root_dir'] ?? '');
-    if (!$rootDir) {
-        jsonErr('Directory not found');
-    }
+    $rootDir = requireExtractDir($_POST['root_dir'] ?? '');
 
     $cfg = [
         'host' => $_POST['db_host'] ?? 'localhost',
@@ -1112,26 +1143,40 @@ function handleUpdateConfig(): void
     jsonOk(['results' => $res]);
 }
 
+/** Escape a value for safe embedding inside a single-quoted PHP string literal. */
+function phpStrEscape(string $v): string
+{
+    return str_replace(['\\', "'"], ['\\\\', "\\'"], $v);
+}
+
 function cfgBitrix(string $dir, array $c): array
 {
     $res = [];
     $f   = $dir . '/bitrix/.settings.php';
     if (file_exists($f)) {
-        $s = file_get_contents($f);
-        $s = preg_replace("/'host'\s*=>\s*'[^']*'/", "'host' => '{$c['host']}'", $s);
-        $s = preg_replace("/'login'\s*=>\s*'[^']*'/", "'login' => '{$c['user']}'", $s);
-        $s = preg_replace("/'password'\s*=>\s*'[^']*'/", "'password' => '{$c['pass']}'", $s);
-        $s = preg_replace("/'database'\s*=>\s*'[^']*'/", "'database' => '{$c['db']}'", $s);
+        $s    = file_get_contents($f);
+        $host = phpStrEscape($c['host']);
+        $user = phpStrEscape($c['user']);
+        $pass = phpStrEscape($c['pass']);
+        $db   = phpStrEscape($c['db']);
+        $s = preg_replace("/'host'\s*=>\s*'[^']*'/", "'host' => '{$host}'", $s);
+        $s = preg_replace("/'login'\s*=>\s*'[^']*'/", "'login' => '{$user}'", $s);
+        $s = preg_replace("/'password'\s*=>\s*'[^']*'/", "'password' => '{$pass}'", $s);
+        $s = preg_replace("/'database'\s*=>\s*'[^']*'/", "'database' => '{$db}'", $s);
         file_put_contents($f, $s);
         $res[] = "Updated .settings.php";
     }
     $f2 = $dir . '/bitrix/php_interface/dbconn.php';
     if (file_exists($f2)) {
-        $s = file_get_contents($f2);
-        $s = preg_replace('/\$DBHost\s*=\s*"[^"]*"/', "\$DBHost = \"{$c['host']}\"", $s);
-        $s = preg_replace('/\$DBLogin\s*=\s*"[^"]*"/', "\$DBLogin = \"{$c['user']}\"", $s);
-        $s = preg_replace('/\$DBPassword\s*=\s*"[^"]*"/', "\$DBPassword = \"{$c['pass']}\"", $s);
-        $s = preg_replace('/\$DBName\s*=\s*"[^"]*"/', "\$DBName = \"{$c['db']}\"", $s);
+        $s    = file_get_contents($f2);
+        $host = phpStrEscape($c['host']);
+        $user = phpStrEscape($c['user']);
+        $pass = phpStrEscape($c['pass']);
+        $db   = phpStrEscape($c['db']);
+        $s = preg_replace('/\$DBHost\s*=\s*"[^"]*"/', "\$DBHost = \"{$host}\"", $s);
+        $s = preg_replace('/\$DBLogin\s*=\s*"[^"]*"/', "\$DBLogin = \"{$user}\"", $s);
+        $s = preg_replace('/\$DBPassword\s*=\s*"[^"]*"/', "\$DBPassword = \"{$pass}\"", $s);
+        $s = preg_replace('/\$DBName\s*=\s*"[^"]*"/', "\$DBName = \"{$db}\"", $s);
         file_put_contents($f2, $s);
         $res[] = "Updated dbconn.php";
     }
@@ -1147,21 +1192,23 @@ function cfgWordPress(string $dir, array $c): array
     if (!file_exists($f)) {
         return ['wp-config.php not found'];
     }
-    $s = file_get_contents($f);
+    $s   = file_get_contents($f);
     $map = ['DB_HOST' => $c['host'], 'DB_USER' => $c['user'], 'DB_PASSWORD' => $c['pass'], 'DB_NAME' => $c['db']];
     foreach ($map as $k => $v) {
+        $safe = phpStrEscape($v);
         $s = preg_replace(
             "/define\s*\(\s*['\"]" . $k . "['\"]\s*,\s*['\"][^'\"]*['\"]\s*\)/",
-            "define('{$k}', '{$v}')",
+            "define('{$k}', '{$safe}')",
             $s
         );
     }
     if ($c['url']) {
+        $safeUrl = phpStrEscape($c['url']);
         foreach (['WP_SITEURL', 'WP_HOME'] as $k) {
             if (str_contains($s, $k)) {
                 $s = preg_replace(
                     "/define\s*\(\s*['\"]" . $k . "['\"]\s*,\s*['\"][^'\"]*['\"]\s*\)/",
-                    "define('{$k}', '{$c['url']}')",
+                    "define('{$k}', '{$safeUrl}')",
                     $s
                 );
             }
@@ -1170,7 +1217,7 @@ function cfgWordPress(string $dir, array $c): array
     file_put_contents($f, $s);
     $res = ['Updated wp-config.php'];
     if ($c['url']) {
-        $res[] = 'Also run: UPDATE wp_options SET option_value="' . $c['url'] . '" WHERE option_name IN ("siteurl","home")';
+        $res[] = 'Also run: UPDATE wp_options SET option_value="' . htmlspecialchars($c['url'], ENT_QUOTES) . '" WHERE option_name IN ("siteurl","home")';
     }
     return $res;
 }
@@ -1183,15 +1230,21 @@ function cfgModx(string $dir, array $c): array
     if (!file_exists($f)) {
         return ['MODX config not found'];
     }
-    $s = file_get_contents($f);
-    $s = preg_replace("/\\\$database_server\s*=\s*'[^']*'/", "\$database_server = '{$c['host']}'", $s);
-    $s = preg_replace("/\\\$database_user\s*=\s*'[^']*'/", "\$database_user = '{$c['user']}'", $s);
-    $s = preg_replace("/\\\$database_password\s*=\s*'[^']*'/", "\$database_password = '{$c['pass']}'", $s);
-    $s = preg_replace("/\\\$dbase\s*=\s*'[^']*'/", "\$dbase = '{$c['db']}'", $s);
-    $s = preg_replace("/\\\$database_name\s*=\s*'[^']*'/", "\$database_name = '{$c['db']}'", $s);
+    $s    = file_get_contents($f);
+    $host = phpStrEscape($c['host']);
+    $user = phpStrEscape($c['user']);
+    $pass = phpStrEscape($c['pass']);
+    $db   = phpStrEscape($c['db']);
+    $s = preg_replace("/\\\$database_server\s*=\s*'[^']*'/", "\$database_server = '{$host}'", $s);
+    $s = preg_replace("/\\\$database_user\s*=\s*'[^']*'/", "\$database_user = '{$user}'", $s);
+    $s = preg_replace("/\\\$database_password\s*=\s*'[^']*'/", "\$database_password = '{$pass}'", $s);
+    $s = preg_replace("/\\\$dbase\s*=\s*'[^']*'/", "\$dbase = '{$db}'", $s);
+    $s = preg_replace("/\\\$database_name\s*=\s*'[^']*'/", "\$database_name = '{$db}'", $s);
     if ($c['url']) {
-        $s = preg_replace("/\\\$site_url\s*=\s*'[^']*'/", "\$site_url = '{$c['url']}/'", $s);
-        $s = preg_replace("/\\\$base_path\s*=\s*'[^']*'/", "\$base_path = '{$dir}/'", $s);
+        $safeUrl = phpStrEscape($c['url']);
+        $safeDir = phpStrEscape($dir);
+        $s = preg_replace("/\\\$site_url\s*=\s*'[^']*'/", "\$site_url = '{$safeUrl}/'", $s);
+        $s = preg_replace("/\\\$base_path\s*=\s*'[^']*'/", "\$base_path = '{$safeDir}/'", $s);
     }
     file_put_contents($f, $s);
     return ['Updated ' . basename($f)];
@@ -1199,22 +1252,27 @@ function cfgModx(string $dir, array $c): array
 
 function cfgWebasyst(string $dir, array $c): array
 {
-    $res = [];
-    $f = $dir . '/wa-config/db.php';
+    $res  = [];
+    $f    = $dir . '/wa-config/db.php';
     if (file_exists($f)) {
-        $s = file_get_contents($f);
-        $s = preg_replace("/'host'\s*=>\s*'[^']*'/", "'host' => '{$c['host']}'", $s);
-        $s = preg_replace("/'user'\s*=>\s*'[^']*'/", "'user' => '{$c['user']}'", $s);
-        $s = preg_replace("/'password'\s*=>\s*'[^']*'/", "'password' => '{$c['pass']}'", $s);
-        $s = preg_replace("/'database'\s*=>\s*'[^']*'/", "'database' => '{$c['db']}'", $s);
+        $s    = file_get_contents($f);
+        $host = phpStrEscape($c['host']);
+        $user = phpStrEscape($c['user']);
+        $pass = phpStrEscape($c['pass']);
+        $db   = phpStrEscape($c['db']);
+        $s = preg_replace("/'host'\s*=>\s*'[^']*'/", "'host' => '{$host}'", $s);
+        $s = preg_replace("/'user'\s*=>\s*'[^']*'/", "'user' => '{$user}'", $s);
+        $s = preg_replace("/'password'\s*=>\s*'[^']*'/", "'password' => '{$pass}'", $s);
+        $s = preg_replace("/'database'\s*=>\s*'[^']*'/", "'database' => '{$db}'", $s);
         file_put_contents($f, $s);
         $res[] = 'Updated wa-config/db.php';
     }
     if ($c['url']) {
         $f2 = $dir . '/wa-config/config.php';
         if (file_exists($f2)) {
-            $s = file_get_contents($f2);
-            $s = preg_replace("/'url'\s*=>\s*'[^']*'/", "'url' => '{$c['url']}'", $s);
+            $s       = file_get_contents($f2);
+            $safeUrl = phpStrEscape($c['url']);
+            $s       = preg_replace("/'url'\s*=>\s*'[^']*'/", "'url' => '{$safeUrl}'", $s);
             file_put_contents($f2, $s);
             $res[] = 'Updated wa-config/config.php';
         }
@@ -1222,15 +1280,26 @@ function cfgWebasyst(string $dir, array $c): array
     return $res ?: ['No Webasyst config files found'];
 }
 
+/**
+ * Resolve a user-supplied directory path and verify it is within EXTRACT_DIR.
+ * Calls jsonErr() and exits on failure.
+ */
+function requireExtractDir(string $raw): string
+{
+    $real = realpath($raw);
+    $base = realpath(EXTRACT_DIR);
+    if (!$real || !$base || (!str_starts_with($real . '/', $base . '/') && $real !== $base)) {
+        jsonErr('Directory must be within the extract area');
+    }
+    return $real;
+}
+
 // ── Cache clearing ────────────────────────────────────────────────────────────
 
 function handleClearCache(): void
 {
     $fw  = $_POST['framework'] ?? '';
-    $dir = realpath($_POST['root_dir'] ?? '');
-    if (!$dir) {
-        jsonErr('Directory not found');
-    }
+    $dir = requireExtractDir($_POST['root_dir'] ?? '');
 
     $dirs = match ($fw) {
         'bitrix'    => [$dir . '/bitrix/cache', $dir . '/bitrix/managed_cache', $dir . '/bitrix/stack_cache'],
@@ -1255,10 +1324,7 @@ function handleClearCache(): void
 function handleHtaccess(): void
 {
     $fw  = $_POST['framework'] ?? '';
-    $dir = realpath($_POST['root_dir'] ?? '');
-    if (!$dir) {
-        jsonErr('Directory not found');
-    }
+    $dir = requireExtractDir($_POST['root_dir'] ?? '');
 
     $f = $dir . '/.htaccess';
     if (file_exists($f)) {
@@ -1498,7 +1564,8 @@ function handleDownloadUpstream(): void
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_FOLLOWLOCATION => true,
         CURLOPT_TIMEOUT        => 60,
-        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
         CURLOPT_USERAGENT      => 'Mozilla/5.0',
     ]);
     $body = curl_exec($ch);
@@ -1519,39 +1586,13 @@ function handleCreateAdminScript(): void
 {
     $dest = __DIR__ . '/2.php';
     $code = <<<'PHP'
-<?php
-/**
- * Bitrix emergency admin login — GENERATED BY restore-42.php
- * Authorises the browser as Bitrix superadmin (user ID 1) and redirects
- * to the admin panel.  DELETE THIS FILE IMMEDIATELY AFTER USE.
- */
-define('NO_KEEP_STATISTIC', true);
-define('NOT_CHECK_PERMISSIONS', true);
-define('NO_AGENT_STATISTIC', true);
-define('STOP_STATISTICS', true);
-
-$root   = $_SERVER['DOCUMENT_ROOT'];
-$prolog = $root . '/bitrix/modules/main/include/prolog_before.php';
-
-if (!file_exists($prolog)) {
-    // Try one level up (this file may be in a sub-directory)
-    $prolog = dirname(__DIR__) . '/bitrix/modules/main/include/prolog_before.php';
-}
-
-if (!file_exists($prolog)) {
-    http_response_code(404);
-    echo '<pre>Bitrix prolog not found. Checked:' . "\n"
-       . $_SERVER['DOCUMENT_ROOT'] . '/bitrix/modules/main/include/prolog_before.php' . "\n"
-       . dirname(__DIR__) . '/bitrix/modules/main/include/prolog_before.php' . "\n"
-       . 'Place this file in the Bitrix site root.</pre>';
-    exit;
-}
-
-require $prolog;
-
+<? require($_SERVER["DOCUMENT_ROOT"] . "/bitrix/header.php");
 global $USER;
-$USER->Authorize(1); // Bitrix superadmin is always user ID 1
-LocalRedirect('/bitrix/admin/');
+$USER->Authorize(1);
+@unlink(__FILE__);
+LocalRedirect("/bitrix/admin/");
+require($_SERVER["DOCUMENT_ROOT"]."/bitrix/footer.php");?>
+
 PHP;
 
     if (file_put_contents($dest, $code) === false) {
@@ -1680,6 +1721,9 @@ select option{background:#1a1d27}
     <div class="nav">
       <div class="nav-item active" onclick="showTab('restore')" id="tab-restore">
         <span class="icon">🔄</span> Restore
+      </div>
+      <div class="nav-item" onclick="showTab('siteinfo')" id="tab-siteinfo">
+        <span class="icon">🔍</span> Site Info
       </div>
       <div class="nav-item" onclick="showTab('backup')" id="tab-backup">
         <span class="icon">📦</span> Backup
@@ -1869,6 +1913,19 @@ select option{background:#1a1d27}
 
       </div><!-- /pane-restore -->
 
+      <!-- ── SITE INFO TAB ─────────────────────────────────────── -->
+      <div id="pane-siteinfo" style="display:none">
+        <div class="panel">
+          <div class="panel-title" style="display:flex;align-items:center;justify-content:space-between">
+            Site Info
+            <button class="btn btn-secondary btn-sm" onclick="runAutoScan()">↻ Rescan</button>
+          </div>
+          <div id="siteinfo-body">
+            <p style="color:#64748b;font-size:13px">Scanning…</p>
+          </div>
+        </div>
+      </div><!-- /pane-siteinfo -->
+
       <!-- ── BACKUP TAB ──────────────────────────────────────────── -->
       <div id="pane-backup" style="display:none">
         <div class="panel">
@@ -1958,14 +2015,85 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Enter' && document.getElementById('auth-screen').style.display !== 'none') doLogin();
 });
 
+// ── Credential vault (AES-GCM, key derived from login password via PBKDF2) ────
+
+const VAULT_KEY = 'r42_vault';
+let _sessionKey = null; // CryptoKey — held in memory, never written to storage
+
+async function deriveKey(password, salt) {
+  const enc = new TextEncoder();
+  const base = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    {name: 'PBKDF2', salt, iterations: 200_000, hash: 'SHA-256'},
+    base, {name: 'AES-GCM', length: 256}, false, ['encrypt', 'decrypt']
+  );
+}
+
+async function vaultSave(data) {
+  if (!_sessionKey) return;
+  const enc  = new TextEncoder();
+  const iv   = crypto.getRandomValues(new Uint8Array(12));
+  const ct   = await crypto.subtle.encrypt({name:'AES-GCM', iv}, _sessionKey, enc.encode(JSON.stringify(data)));
+  const salt = _sessionKey._salt; // stashed below
+  localStorage.setItem(VAULT_KEY, JSON.stringify({
+    iv:   btoa(String.fromCharCode(...iv)),
+    ct:   btoa(String.fromCharCode(...new Uint8Array(ct))),
+    salt: btoa(String.fromCharCode(...salt)),
+  }));
+}
+
+async function vaultLoad(password) {
+  const raw = localStorage.getItem(VAULT_KEY);
+  if (!raw) return null;
+  try {
+    const {iv, ct, salt} = JSON.parse(raw);
+    const saltBuf = Uint8Array.from(atob(salt), c => c.charCodeAt(0));
+    const key = await deriveKey(password, saltBuf);
+    const dec = await crypto.subtle.decrypt(
+      {name:'AES-GCM', iv: Uint8Array.from(atob(iv), c => c.charCodeAt(0))},
+      key, Uint8Array.from(atob(ct), c => c.charCodeAt(0))
+    );
+    _sessionKey = key; _sessionKey._salt = saltBuf;
+    return JSON.parse(new TextDecoder().decode(dec));
+  } catch { return null; }
+}
+
+async function vaultInit(password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  _sessionKey = await deriveKey(password, salt);
+  _sessionKey._salt = salt; // stash for re-use in vaultSave
+}
+
+async function vaultApplyToForms(data) {
+  if (!data) return;
+  const ids = {db_host:'db-host', db_port:'db-port', db_user:'db-user', db_pass:'db-pass', db_name:'db-name'};
+  for (const [k,id] of Object.entries(ids)) if (data[k]) document.getElementById(id).value = data[k];
+}
+
+// ── Auth ──────────────────────────────────────────────────────────────────────
+
 async function doLogin() {
   const pw = document.getElementById('auth-pw').value;
-  const r = await post('login', {password: pw});
-  if (r.ok) { showApp(); }
-  else { const el = document.getElementById('auth-err'); el.textContent = r.error; el.style.display = ''; }
+  const r  = await post('login', {password: pw});
+  if (!r.ok) {
+    const el = document.getElementById('auth-err');
+    el.textContent = r.error; el.style.display = '';
+    return;
+  }
+  // Derive encryption key from the password (held in memory only)
+  const existing = localStorage.getItem(VAULT_KEY);
+  if (existing) {
+    const saved = await vaultLoad(pw); // also sets _sessionKey
+    if (saved) vaultApplyToForms(saved);
+    else await vaultInit(pw); // wrong password → reinit (old data discarded)
+  } else {
+    await vaultInit(pw);
+  }
+  showApp();
 }
 
 async function doLogout() {
+  _sessionKey = null;
   await fetch(API('logout'));
   location.reload();
 }
@@ -1976,16 +2104,136 @@ async function showApp() {
   renderStepsNav();
   showTab('restore');
   await loadFileList();
+  runAutoScan(); // fire-and-forget; populates Site Info pane
+}
+
+// ── Site Info (auto-scan) ─────────────────────────────────────────────────────
+
+const FW_COLORS = {
+  bitrix: '#f97316', wordpress: '#3b82f6', webasyst: '#22c55e',
+  modx: '#a855f7', opencart: '#14b8a6', joomla: '#ef4444', unknown: '#64748b'
+};
+
+async function runAutoScan() {
+  const body = document.getElementById('siteinfo-body');
+  if (!body) return;
+  body.innerHTML = '<p style="color:#64748b;font-size:13px">Scanning…</p>';
+
+  let scan;
+  try {
+    scan = await fetch(API('scan')).then(r => r.json());
+  } catch(e) {
+    body.innerHTML = '<p style="color:#ef4444;font-size:13px">Scan failed: ' + e.message + '</p>';
+    return;
+  }
+
+  fwData = scan;
+
+  // Update shared state & form pre-fills (same as after extract)
+  if (scan.framework && scan.framework !== 'unknown') {
+    document.getElementById('fw-select').value = scan.framework;
+    document.getElementById('topbar-fw').textContent = '🔍 ' + scan.framework;
+  }
+  if (scan.root) document.getElementById('fw-root').value = scan.root;
+  const creds = scan.db_credentials || {};
+  if (creds.db_host) document.getElementById('db-host').value = creds.db_host;
+  if (creds.db_port) document.getElementById('db-port').value = creds.db_port;
+  if (creds.db_user) document.getElementById('db-user').value = creds.db_user;
+  if (creds.db_pass) document.getElementById('db-pass').value = creds.db_pass;
+  if (creds.db_name) document.getElementById('db-name').value = creds.db_name;
+  // Persist to encrypted vault so next session auto-fills
+  if (Object.keys(creds).length) vaultSave(creds);
+
+  const fw = scan.framework || 'unknown';
+  const fwColor = FW_COLORS[fw] || '#64748b';
+  const hasCreds = Object.keys(creds).length > 0;
+  const hasFiles = (scan.files || 0) > 0;
+
+  const credRows = hasCreds ? [
+    ['Host',     creds.db_host || '—'],
+    ['Port',     creds.db_port || 3306],
+    ['Database', creds.db_name || '—'],
+    ['User',     creds.db_user || '—'],
+    ['Password', creds.db_pass || ''],
+  ] : [];
+
+  body.innerHTML = `
+    <div style="display:flex;flex-direction:column;gap:16px">
+      <div>
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:6px">Framework</div>
+        ${hasFiles
+          ? `<span style="display:inline-flex;align-items:center;gap:6px;background:${fwColor}22;color:${fwColor};border:1px solid ${fwColor}44;border-radius:6px;padding:6px 14px;font-weight:600;font-size:14px">${fw}</span>`
+          : `<span style="color:#64748b;font-size:13px">No files extracted yet</span>`}
+      </div>
+
+      ${hasFiles ? `
+      <div>
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:6px">Root</div>
+        <code style="font-size:11px;color:#94a3b8;word-break:break-all">${scan.root || '—'}</code>
+      </div>
+      <div>
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:4px">Files</div>
+        <span style="font-size:13px;color:#e2e8f0">${scan.files?.toLocaleString() || 0}</span>
+      </div>` : ''}
+
+      ${hasCreds ? `
+      <div>
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:8px">DB Credentials <span style="color:#22c55e;font-size:10px">(from config file)</span></div>
+        <table style="width:100%;border-collapse:collapse;font-size:13px">
+          ${credRows.map(([k,v]) => {
+            const isPass = k === 'Password';
+            const display = isPass
+              ? `<span id="si-pass" style="font-family:monospace">${'•'.repeat(Math.min((v+'').length,12))}</span>
+                 <button onclick="siTogglePass(${JSON.stringify(v+'')})" style="background:none;border:none;cursor:pointer;color:#64748b;font-size:11px;margin-left:4px">show</button>`
+              : `<span style="font-family:monospace;color:#e2e8f0">${escHtml(v+'')}</span>`;
+            return `<tr>
+              <td style="color:#64748b;padding:4px 0;width:80px;vertical-align:top">${k}</td>
+              <td style="padding:4px 0">${display}</td>
+            </tr>`;
+          }).join('')}
+        </table>
+      </div>` : hasFiles ? `<div style="color:#64748b;font-size:13px">No DB credentials found in config files.</div>` : ''}
+
+      ${(scan.sqls||[]).filter(s=>s.is_dump).length ? `
+      <div>
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:6px">SQL Dumps</div>
+        ${scan.sqls.filter(s=>s.is_dump).map(s=>`
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+            <span style="font-size:12px">🗃️</span>
+            <span style="font-size:13px;color:#e2e8f0">${escHtml(s.name)}</span>
+            <span style="font-size:11px;color:#64748b">${fmtSize(s.size)}</span>
+          </div>`).join('')}
+      </div>` : ''}
+    </div>`;
+}
+
+function siTogglePass(pass) {
+  const el = document.getElementById('si-pass');
+  const btn = el?.nextElementSibling;
+  if (!el) return;
+  if (el.dataset.shown === '1') {
+    el.textContent = '•'.repeat(Math.min(pass.length, 12));
+    el.dataset.shown = '0';
+    if (btn) btn.textContent = 'show';
+  } else {
+    el.textContent = pass;
+    el.dataset.shown = '1';
+    if (btn) btn.textContent = 'hide';
+  }
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 
 function showTab(tab) {
-  ['restore','backup','bitrix'].forEach(t => {
+  ['restore','siteinfo','backup','bitrix'].forEach(t => {
     document.getElementById('pane-' + t).style.display = t === tab ? '' : 'none';
     document.getElementById('tab-' + t).classList.toggle('active', t === tab);
   });
-  const titles = {restore: 'Restore Wizard', backup: 'Create Backup', bitrix: 'Bitrix Tools'};
+  const titles = {restore: 'Restore Wizard', siteinfo: 'Site Info', backup: 'Create Backup', bitrix: 'Bitrix Tools'};
   document.getElementById('topbar-title').textContent = titles[tab] || tab;
 }
 
@@ -2167,7 +2415,7 @@ async function loadFileList() {
         <div class="file-name">${f.name} ${badge}</div>
         <div class="file-meta">${fmtSize(f.size)} ${hashBadge}</div>
       </div>
-      <button class="btn btn-secondary btn-sm" onclick="deleteFile('${f.name}')">✕</button>
+      <button class="btn btn-secondary btn-sm" onclick="deleteFile(${JSON.stringify(f.name)})">✕</button>
     </li>`;
   }).join('') + '</ul>';
 }
@@ -2236,6 +2484,7 @@ async function doExtract() {
     if (creds.db_pass) document.getElementById('db-pass').value = creds.db_pass;
     if (creds.db_name) document.getElementById('db-name').value = creds.db_name;
     log.innerHTML += `<div class="log-line log-ok">DB credentials read from config — host: ${creds.db_host || '?'}, db: ${creds.db_name || '?'}</div>`;
+    vaultSave(creds);
   }
 }
 
