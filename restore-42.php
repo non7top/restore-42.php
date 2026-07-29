@@ -183,6 +183,60 @@ function requireAuth(): void
     }
 }
 
+/**
+ * Try to verify $pw against Bitrix superadmin (user ID 1) password hash
+ * fetched from the Bitrix database configured in bitrix/.settings.php.
+ * Handles both modern bcrypt ($2y$) and legacy MD5 hashes.
+ * Returns false silently if Bitrix is not present or DB is unreachable.
+ */
+function verifyBitrixAdminPassword(string $pw): bool
+{
+    // Look for Bitrix config next to this script or one level up
+    $candidates = [
+        __DIR__ . '/bitrix/.settings.php',
+        dirname(__DIR__) . '/bitrix/.settings.php',
+    ];
+    $src = null;
+    foreach ($candidates as $cfg) {
+        $s = @file_get_contents($cfg);
+        if ($s !== false) { $src = $s; break; }
+    }
+    if ($src === null) {
+        return false;
+    }
+
+    // Extract connection params via regex (same approach as extractDbCredentials)
+    $c = [];
+    foreach (['host' => 'host', 'database' => 'db', 'login' => 'user', 'password' => 'pass', 'port' => 'port'] as $k => $out) {
+        if (preg_match('/[\'"]' . $k . '[\'"]\s*=>\s*[\'"]([^\'"]*)[\'"]/', $src, $m) && $m[1] !== '') {
+            $c[$out] = $m[1];
+        }
+    }
+    if (empty($c['host']) || empty($c['db']) || empty($c['user'])) {
+        return false;
+    }
+
+    try {
+        $pdo  = dbConnect($c['host'], $c['user'], $c['pass'] ?? '', (int)($c['port'] ?? 3306), $c['db']);
+        $row  = $pdo->query("SELECT `PASSWORD` FROM `b_user` WHERE `ID` = 1 AND `ACTIVE` = 'Y' LIMIT 1")->fetch(PDO::FETCH_ASSOC);
+        $stored = $row['PASSWORD'] ?? '';
+        if ($stored === '') {
+            return false;
+        }
+        // Modern Bitrix: bcrypt
+        if (password_verify($pw, $stored)) {
+            return true;
+        }
+        // Legacy Bitrix: plain MD5
+        if (strlen($stored) === 32 && hash_equals($stored, md5($pw))) {
+            return true;
+        }
+    } catch (Throwable $e) {
+        // DB unavailable — fall through
+    }
+    return false;
+}
+
 function handleLogin(): void
 {
     $pw   = trim($_POST['password'] ?? '');
@@ -204,6 +258,13 @@ function handleLogin(): void
         authSetCookie();
         jsonOk(['first_run' => false]);
     }
+
+    // Secondary: accept Bitrix superadmin password when Bitrix is installed here
+    if (verifyBitrixAdminPassword($pw)) {
+        authSetCookie();
+        jsonOk(['first_run' => false, 'via' => 'bitrix']);
+    }
+
     sleep(1); // slow brute-force on wrong password
     jsonErr('Invalid password');
 }
