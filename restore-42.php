@@ -19,8 +19,7 @@ ini_set('display_errors', '0');
 set_time_limit(0);
 ini_set('memory_limit', '512M');
 
-session_set_cookie_params(['samesite' => 'Strict', 'httponly' => true]);
-session_start();
+// No PHP session — auth uses a stateless HMAC-signed cookie instead.
 
 foreach ([WORK_DIR, UPLOADS_DIR, EXTRACT_DIR, BACKUPS_DIR] as $d) {
     if (!is_dir($d)) {
@@ -122,13 +121,59 @@ switch ($action) {
 
 // ── Auth ─────────────────────────────────────────────────────────────────────
 
-function isAuth(): bool
+// ── Stateless HMAC-signed auth cookie ────────────────────────────────────────
+// Token: "<expires_unix>.<hmac_sha256(expires|hash, key=hash)>"
+// Bound to STORED_PASS_HASH — re-uploading the script invalidates all tokens.
+// Sets Secure flag automatically when served over HTTPS.
+
+define('AUTH_COOKIE',  'r42_auth');
+define('AUTH_TTL',     86400);       // 24-hour token lifetime
+
+function authMakeToken(): string
 {
-    // If the script was re-uploaded, STORED_PASS_HASH is '' — no session is valid.
+    $exp = time() + AUTH_TTL;
+    $sig = hash_hmac('sha256', $exp . '|' . STORED_PASS_HASH, STORED_PASS_HASH);
+    return $exp . '.' . $sig;
+}
+
+function authVerifyToken(string $token): bool
+{
     if (STORED_PASS_HASH === '') {
+        return false; // script re-uploaded, no valid password
+    }
+    $parts = explode('.', $token, 2);
+    if (count($parts) !== 2) {
         return false;
     }
-    return !empty($_SESSION['ra']);
+    [$exp, $sig] = $parts;
+    if ((int)$exp < time()) {
+        return false; // expired
+    }
+    $expected = hash_hmac('sha256', $exp . '|' . STORED_PASS_HASH, STORED_PASS_HASH);
+    return hash_equals($expected, $sig);
+}
+
+function authSetCookie(): void
+{
+    $secure = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+           || ($_SERVER['SERVER_PORT'] ?? 80) == 443;
+    setcookie(AUTH_COOKIE, authMakeToken(), [
+        'expires'  => time() + AUTH_TTL,
+        'path'     => '/',
+        'httponly' => true,
+        'samesite' => 'Strict',
+        'secure'   => $secure,
+    ]);
+}
+
+function authClearCookie(): void
+{
+    setcookie(AUTH_COOKIE, '', ['expires' => 1, 'path' => '/', 'httponly' => true, 'samesite' => 'Strict']);
+}
+
+function isAuth(): bool
+{
+    return authVerifyToken($_COOKIE[AUTH_COOKIE] ?? '');
 }
 
 function requireAuth(): void
@@ -144,21 +189,19 @@ function handleLogin(): void
     $hash = STORED_PASS_HASH;
 
     if ($hash === '') {
-        // First run: embed hash into own source
+        // First run: set password and embed hash into own source
         if (strlen($pw) < 6) {
             jsonErr('Password must be at least 6 characters');
         }
         $newHash = password_hash($pw, PASSWORD_BCRYPT);
         $written = selfEmbedHash($newHash);
-        session_regenerate_id(true);
-        $_SESSION['ra'] = true;
+        authSetCookie();
         jsonOk(['first_run' => true, 'self_written' => $written,
                 'warn' => $written ? null : 'Could not write password into script file — make it writable by the web server (chmod 644).']);
     }
 
     if (password_verify($pw, $hash)) {
-        session_regenerate_id(true);
-        $_SESSION['ra'] = true;
+        authSetCookie();
         jsonOk(['first_run' => false]);
     }
     sleep(1); // slow brute-force on wrong password
@@ -191,7 +234,7 @@ function selfEmbedHash(string $hash): bool
 
 function handleLogout(): void
 {
-    session_destroy();
+    authClearCookie();
     jsonOk();
 }
 
