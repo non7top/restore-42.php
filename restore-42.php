@@ -55,7 +55,13 @@ switch ($action) {
         handleLogout();
         break;
     case 'check_auth':
-        jsonOk(['auth' => isAuth()]);
+        $authMode = STORED_PASS_HASH === '' ? 'first_run'
+                  : (str_starts_with(STORED_PASS_HASH, 'bitrix:') ? 'bitrix' : 'local');
+        jsonOk([
+            'auth'             => isAuth(),
+            'mode'             => $authMode,
+            'bitrix_available' => detectBitrixPresent(),
+        ]);
         break;
     case 'upload':
         handleUpload();
@@ -129,10 +135,24 @@ switch ($action) {
 define('AUTH_COOKIE',  'r42_auth');
 define('AUTH_TTL',     604800);      // 7-day token lifetime
 
-function authMakeToken(): string
+/**
+ * Return the HMAC signing key for auth tokens.
+ * In Bitrix-auth mode STORED_PASS_HASH is "bitrix:<64-char-hex>"; we use the
+ * hex part as the key so the format of the stored value doesn't leak into tokens.
+ */
+function authSigningKey(): string
 {
+    if (str_starts_with(STORED_PASS_HASH, 'bitrix:')) {
+        return substr(STORED_PASS_HASH, 7);
+    }
+    return STORED_PASS_HASH;
+}
+
+function authMakeToken(string $keyOverride = ''): string
+{
+    $key = $keyOverride !== '' ? $keyOverride : authSigningKey();
     $exp = time() + AUTH_TTL;
-    $sig = hash_hmac('sha256', $exp . '|' . STORED_PASS_HASH, STORED_PASS_HASH);
+    $sig = hash_hmac('sha256', $exp . '|' . $key, $key);
     return $exp . '.' . $sig;
 }
 
@@ -149,21 +169,28 @@ function authVerifyToken(string $token): bool
     if ((int)$exp < time()) {
         return false; // expired
     }
-    $expected = hash_hmac('sha256', $exp . '|' . STORED_PASS_HASH, STORED_PASS_HASH);
+    $key      = authSigningKey();
+    $expected = hash_hmac('sha256', $exp . '|' . $key, $key);
     return hash_equals($expected, $sig);
 }
 
-function authSetCookie(): void
+function authSetCookie(string $keyOverride = ''): void
 {
     $secure = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
            || ($_SERVER['SERVER_PORT'] ?? 80) == 443;
-    setcookie(AUTH_COOKIE, authMakeToken(), [
+    setcookie(AUTH_COOKIE, authMakeToken($keyOverride), [
         'expires'  => time() + AUTH_TTL,
         'path'     => '/',
         'httponly' => true,
         'samesite' => 'Strict',
         'secure'   => $secure,
     ]);
+}
+
+function detectBitrixPresent(): bool
+{
+    return file_exists(__DIR__ . '/bitrix/.settings.php')
+        || file_exists(dirname(__DIR__) . '/bitrix/.settings.php');
 }
 
 function authClearCookie(): void
@@ -240,29 +267,51 @@ function verifyBitrixAdminPassword(string $pw): bool
 function handleLogin(): void
 {
     $pw   = trim($_POST['password'] ?? '');
+    $via  = $_POST['via'] ?? 'local'; // 'local' | 'bitrix'
     $hash = STORED_PASS_HASH;
 
     if ($hash === '') {
-        // First run: set password and embed hash into own source
+        // ── First run ────────────────────────────────────────────────────────
+        if ($via === 'bitrix') {
+            // User chose "Login with Bitrix" on the first-run screen
+            if (!verifyBitrixAdminPassword($pw)) {
+                sleep(1);
+                jsonErr('Bitrix admin password not accepted');
+            }
+            // Store a random signing key with a 'bitrix:' marker
+            $key     = bin2hex(random_bytes(32));
+            $written = selfEmbedHash('bitrix:' . $key);
+            authSetCookie($key);
+            jsonOk(['first_run' => true, 'via' => 'bitrix', 'self_written' => $written]);
+        }
+        // Local password setup
         if (strlen($pw) < 6) {
             jsonErr('Password must be at least 6 characters');
         }
         $newHash = password_hash($pw, PASSWORD_BCRYPT);
         $written = selfEmbedHash($newHash);
-        authSetCookie();
+        authSetCookie($newHash); // constant not updated yet — pass key explicitly
         jsonOk(['first_run' => true, 'self_written' => $written,
                 'warn' => $written ? null : 'Could not write password into script file — make it writable by the web server (chmod 644).']);
     }
 
-    if (password_verify($pw, $hash)) {
+    // ── Normal login ─────────────────────────────────────────────────────────
+    $isBitrixMode = str_starts_with($hash, 'bitrix:');
+
+    if (!$isBitrixMode && password_verify($pw, $hash)) {
         authSetCookie();
         jsonOk(['first_run' => false]);
     }
 
-    // Secondary: accept Bitrix superadmin password when Bitrix is installed here
     if (verifyBitrixAdminPassword($pw)) {
         authSetCookie();
         jsonOk(['first_run' => false, 'via' => 'bitrix']);
+    }
+
+    // Bitrix-auth mode but Bitrix is gone — offer emergency local reset
+    if ($isBitrixMode && !detectBitrixPresent()) {
+        sleep(1);
+        jsonErr('Bitrix not found — to reset, delete STORED_PASS_HASH from the script and reload.', 403);
     }
 
     sleep(1); // slow brute-force on wrong password
@@ -1789,9 +1838,9 @@ select option{background:#1a1d27}
 .step-pill.active{background:#1e1b4b;color:#818cf8;border-color:#4f46e5}
 .step-pill.locked{background:#1a1d27;color:#475569;cursor:not-allowed}
 #auth-screen{display:flex;align-items:center;justify-content:center;min-height:100vh;background:#0f1117}
-.auth-box{background:#1a1d27;border:1px solid #2d3148;border-radius:12px;padding:40px;width:360px}
+.auth-box{background:#1a1d27;border:1px solid #2d3148;border-radius:12px;padding:40px;width:320px;flex-shrink:0}
 .auth-box h2{font-size:20px;font-weight:700;margin-bottom:6px;color:#e2e8f0}
-.auth-box p{font-size:13px;color:#64748b;margin-bottom:24px}
+.auth-box p{font-size:13px;color:#64748b;margin-bottom:20px}
 .auth-box input{margin-bottom:12px}
 .drop-zone{border:2px dashed #2d3148;border-radius:8px;padding:32px;text-align:center;cursor:pointer;transition:all .15s}
 .drop-zone:hover,.drop-zone.drag{border-color:#4f46e5;background:#1e1b4b22}
@@ -1813,13 +1862,7 @@ select option{background:#1a1d27}
 <body>
 
 <div id="auth-screen" style="display:none">
-  <div class="auth-box">
-    <h2><?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?></h2>
-    <p id="auth-hint">Loading…</p>
-    <input type="password" id="auth-pw" placeholder="Password" autocomplete="current-password">
-    <button class="btn btn-primary" style="width:100%" onclick="doLogin()">Continue</button>
-    <div id="auth-err" class="alert alert-err" style="display:none;margin-top:12px"></div>
-  </div>
+  <div id="auth-inner"></div>
 </div>
 
 <div id="main-app" style="display:none">
@@ -2105,22 +2148,106 @@ window.addEventListener('beforeunload', e => {
 
 // ── Auth ─────────────────────────────────────────────────────────────────────
 
+const SCRIPT_NAME = <?= json_encode(basename(__FILE__)) ?>;
+
 async function init() {
   const r = await fetch(API('check_auth')).then(r=>r.json());
-  if (r.auth) { showApp(); }
-  else { showAuthScreen(false); }
+  if (r.auth) { showApp(); return; }
+  showAuthScreen(r.mode || 'first_run', r.bitrix_available || false);
 }
 
-function showAuthScreen(firstRun) {
-  document.getElementById('auth-screen').style.display = '';
+function showAuthScreen(mode, bitrixAvailable) {
   document.getElementById('main-app').style.display = 'none';
-  document.getElementById('auth-hint').textContent = firstRun
-    ? 'First run — set a password to continue.' : 'Enter your restore password.';
-  document.getElementById('auth-pw').focus();
+  document.getElementById('auth-screen').style.display = '';
+
+  const inner = document.getElementById('auth-inner');
+  const isBitrixLocked = mode === 'bitrix' && !bitrixAvailable;
+
+  // Build form(s)
+  const localBox = (title, hint, btnLabel, via) => `
+    <div class="auth-box">
+      <h2>${SCRIPT_NAME}</h2>
+      <p>${hint}</p>
+      <input type="password" class="auth-pw-input" placeholder="Password"
+             autocomplete="current-password"
+             onkeydown="if(event.key==='Enter')submitLogin(this,'${via}')">
+      <button class="btn btn-primary" style="width:100%"
+              onclick="submitLogin(this.previousElementSibling,'${via}')">${btnLabel}</button>
+      <div class="auth-err alert alert-err" style="display:none;margin-top:12px"></div>
+    </div>`;
+
+  const bitrixBox = (hint) => `
+    <div class="auth-box">
+      <h2>${SCRIPT_NAME}</h2>
+      <p>${hint}</p>
+      <input type="password" class="auth-pw-input" placeholder="Bitrix admin password"
+             autocomplete="current-password"
+             onkeydown="if(event.key==='Enter')submitLogin(this,'bitrix')">
+      <button class="btn btn-primary" style="width:100%;background:#f97316;border-color:#f97316"
+              onclick="submitLogin(this.previousElementSibling,'bitrix')">Login with Bitrix</button>
+      <div class="auth-err alert alert-err" style="display:none;margin-top:12px"></div>
+    </div>`;
+
+  let html = '<div style="display:flex;gap:24px;flex-wrap:wrap;justify-content:center">';
+
+  if (mode === 'first_run') {
+    if (bitrixAvailable) {
+      html += bitrixBox('Bitrix detected — use your admin (user #1) password.');
+      html += localBox('Set a local password', 'Or set a separate tool password.', 'Set Password &amp; Login', 'local');
+    } else {
+      html += localBox('First run', 'Set a password to protect this tool.', 'Set Password &amp; Login', 'local');
+    }
+  } else if (mode === 'bitrix') {
+    if (isBitrixLocked) {
+      html += `<div class="auth-box">
+        <h2>${SCRIPT_NAME}</h2>
+        <p style="color:#ef4444">Bitrix auth mode is set but Bitrix is not found at this path.</p>
+        <p style="font-size:12px;color:#64748b">To reset: open the script file and clear the <code>STORED_PASS_HASH</code> constant, then reload.</p>
+      </div>`;
+    } else {
+      html += bitrixBox('This tool is linked to Bitrix — use your admin (user #1) password.');
+    }
+  } else {
+    // local mode
+    const hint = bitrixAvailable
+      ? 'Enter your restore password, or use your Bitrix admin password.'
+      : 'Enter your restore password.';
+    html += localBox('Login', hint, 'Login', 'local');
+    if (bitrixAvailable) {
+      html += bitrixBox('Or login directly with your Bitrix admin password.');
+    }
+  }
+
+  html += '</div>';
+  inner.innerHTML = html;
+  inner.querySelector('.auth-pw-input')?.focus();
+}
+
+async function submitLogin(inputEl, via) {
+  const pw  = inputEl.value;
+  const err = inputEl.closest('.auth-box').querySelector('.auth-err');
+  err.style.display = 'none';
+
+  const r = await post('login', {password: pw, via});
+  if (!r.ok) {
+    err.textContent = r.error;
+    err.style.display = '';
+    return;
+  }
+  // Init vault with the password used
+  const existing = localStorage.getItem(VAULT_KEY);
+  if (existing) {
+    const saved = await vaultLoad(pw);
+    if (saved) vaultApplyToForms(saved);
+    else await vaultInit(pw);
+  } else {
+    await vaultInit(pw);
+  }
+  showApp();
 }
 
 document.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && document.getElementById('auth-screen').style.display !== 'none') doLogin();
+  // Legacy fallback — individual inputs use onkeydown directly
 });
 
 // ── Credential vault (AES-GCM, key derived from login password via PBKDF2) ────
@@ -2180,25 +2307,6 @@ async function vaultApplyToForms(data) {
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
-async function doLogin() {
-  const pw = document.getElementById('auth-pw').value;
-  const r  = await post('login', {password: pw});
-  if (!r.ok) {
-    const el = document.getElementById('auth-err');
-    el.textContent = r.error; el.style.display = '';
-    return;
-  }
-  // Derive encryption key from the password (held in memory only)
-  const existing = localStorage.getItem(VAULT_KEY);
-  if (existing) {
-    const saved = await vaultLoad(pw); // also sets _sessionKey
-    if (saved) vaultApplyToForms(saved);
-    else await vaultInit(pw); // wrong password → reinit (old data discarded)
-  } else {
-    await vaultInit(pw);
-  }
-  showApp();
-}
 
 async function doLogout() {
   _sessionKey = null;
