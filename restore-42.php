@@ -824,8 +824,30 @@ function handleScan(): void
     if ($fw === 'unknown' && !empty($sqls)) {
         $fw = detectFrameworkFromSql($sqls[0]['path']);
     }
+
+    $liveSite = false;
+    // Nothing extracted yet — this script may be sitting inside a live site
+    // (e.g. dropped in for emergency access/repair). Detect that instead.
+    if ($fw === 'unknown' && countFiles($root) === 0) {
+        $liveFw = detectFramework(__DIR__);
+        if ($liveFw !== 'unknown') {
+            $fw       = $liveFw;
+            $fwRoot   = findFrameworkRoot(__DIR__);
+            $root     = __DIR__;
+            $liveSite = true;
+        }
+    }
+
     $dbCreds = extractDbCredentials($fwRoot, $fw);
-    jsonOk(['root' => $root, 'nested' => $nested, 'framework' => $fw, 'sqls' => $sqls, 'files' => countFiles($root), 'db_credentials' => $dbCreds]);
+    jsonOk([
+        'root'           => $root,
+        'nested'         => $nested,
+        'framework'      => $fw,
+        'sqls'           => $sqls,
+        'files'          => countFiles($root),
+        'db_credentials' => $dbCreds,
+        'live_site'      => $liveSite,
+    ]);
 }
 
 /**
@@ -2381,6 +2403,7 @@ async function runAutoScan() {
         ${hasFiles
           ? `<span style="display:inline-flex;align-items:center;gap:6px;background:${fwColor}22;color:${fwColor};border:1px solid ${fwColor}44;border-radius:6px;padding:6px 14px;font-weight:600;font-size:14px">${fw}</span>`
           : `<span style="color:#64748b;font-size:13px">No files extracted yet</span>`}
+        ${scan.live_site ? `<span style="margin-left:8px;font-size:11px;color:#64748b">(detected from the live site — no backup extracted yet)</span>` : ''}
       </div>
 
       ${hasFiles ? `
@@ -2400,8 +2423,8 @@ async function runAutoScan() {
           ${credRows.map(([k,v]) => {
             const isPass = k === 'Password';
             const display = isPass
-              ? `<span id="si-pass" style="font-family:monospace">${'•'.repeat(Math.min((v+'').length,12))}</span>
-                 <button onclick="siTogglePass(${JSON.stringify(v+'')})" style="background:none;border:none;cursor:pointer;color:#64748b;font-size:11px;margin-left:4px">show</button>`
+              ? `<span id="si-pass" data-pw="${escHtml(v+'')}" style="font-family:monospace">${'•'.repeat(Math.min((v+'').length,12))}</span>
+                 <button onclick="siTogglePass()" style="background:none;border:none;cursor:pointer;color:#64748b;font-size:11px;margin-left:4px">show</button>`
               : `<span style="font-family:monospace;color:#e2e8f0">${escHtml(v+'')}</span>`;
             return `<tr>
               <td style="color:#64748b;padding:4px 0;width:80px;vertical-align:top">${k}</td>
@@ -2424,9 +2447,10 @@ async function runAutoScan() {
     </div>`;
 }
 
-function siTogglePass(pass) {
-  const el = document.getElementById('si-pass');
-  const btn = el?.nextElementSibling;
+function siTogglePass() {
+  const el   = document.getElementById('si-pass');
+  const btn  = el?.nextElementSibling;
+  const pass = el?.dataset.pw || '';
   if (!el) return;
   if (el.dataset.shown === '1') {
     el.textContent = '•'.repeat(Math.min(pass.length, 12));
@@ -2876,7 +2900,6 @@ function fmtSize(b) {
   if (b >= 1024)       return (b/1024).toFixed(2) + ' KB';
   return b + ' B';
 }
-function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 function fmtTime(s) {
   if (!isFinite(s) || s < 0) return '…';
   if (s < 60) return Math.round(s) + 's';
