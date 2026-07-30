@@ -1186,12 +1186,22 @@ function detectBitrixSites(array $dbCreds): array
             $dbCreds['db_name']
         );
         $rows = $conn->query("SELECT LID, SERVER_NAME, DOC_ROOT FROM b_lang")->fetch_all(MYSQLI_ASSOC);
-        return array_map(fn($r) => [
-            'site_id'    => $r['LID'],
-            'domain'     => $r['SERVER_NAME'],
-            'doc_root'   => $r['DOC_ROOT'],
-            'is_current' => rtrim((string)$r['DOC_ROOT'], '/') === rtrim(__DIR__, '/') || $r['DOC_ROOT'] === '',
-        ], $rows ?: []);
+        // "Current" means this site's SERVER_NAME matches the domain this page
+        // was actually loaded from — the same match Bitrix itself performs
+        // (CSite::GetCurByDomain). DOC_ROOT is usually empty for every site in a
+        // single-docroot install, so it's useless for telling sites apart; it's
+        // only meaningful for flagging a genuinely SEPARATE document root below.
+        $currentHost = strtolower((string)($_SERVER['HTTP_HOST'] ?? ''));
+        return array_map(function ($r) use ($currentHost) {
+            $docRoot = (string)$r['DOC_ROOT'];
+            return [
+                'site_id'       => $r['LID'],
+                'domain'        => $r['SERVER_NAME'],
+                'doc_root'      => $docRoot,
+                'is_current'    => $r['SERVER_NAME'] !== '' && strtolower($r['SERVER_NAME']) === $currentHost,
+                'external_root' => $docRoot !== '' && rtrim($docRoot, '/') !== rtrim(__DIR__, '/'),
+            ];
+        }, $rows ?: []);
     } catch (Throwable $e) {
         return [];
     }
@@ -2597,16 +2607,6 @@ select option{background:#1a1d27}
             </div>
             <div id="devmode-domain-warning" style="display:none;font-size:12px;color:#facc15"></div>
           </div>
-
-          <div id="bitrix-domain-check-section" style="display:none;margin-top:20px">
-            <div style="font-size:13px;font-weight:600;color:#e2e8f0;margin-bottom:6px">Domain configuration (session issues)</div>
-            <p style="color:#94a3b8;font-size:12px;margin-bottom:12px">If <code>main.server_name</code> doesn't match the domain actually bound to the active site in the site list, Bitrix sessions can break. Resolved domain below prefers the site list's bound domain, falling back to <code>main.site_name</code> if none is set.</p>
-            <div id="bitrix-domain-table" style="font-size:12px;font-family:monospace;margin-bottom:10px"></div>
-            <div id="bitrix-domain-fix-wrap" style="display:none">
-              <button class="btn btn-primary btn-sm" onclick="fixBitrixDomain()">Sync server_name to resolved domain</button>
-              <span id="bitrix-domain-fix-result" style="font-size:13px;color:#94a3b8;margin-left:8px"></span>
-            </div>
-          </div>
         </div>
       </div><!-- /pane-frameworkinfo -->
 
@@ -2966,7 +2966,6 @@ async function runAutoScan() {
   const bitrixPanel = document.getElementById('bitrix-tools-panel');
   if (bitrixPanel) bitrixPanel.style.display = (fw === 'bitrix') ? '' : 'none';
   renderDevModeStatus(scan);
-  renderBitrixDomainCheck(scan);
 
   const credRows = hasCreds ? [
     ['Host',     creds.db_host || '—'],
@@ -2982,7 +2981,9 @@ async function runAutoScan() {
   const dot = (ok) => `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${ok ? '#22c55e' : '#ef4444'};margin-right:6px"></span>`;
 
   const bitrixSites = scan.bitrix_sites || [];
-  const externalSites = bitrixSites.filter(s => !s.is_current);
+  const externalSites = bitrixSites.filter(s => s.external_root);
+  const currentSite = bitrixSites.find(s => s.is_current);
+  const domainCheck = scan.bitrix_domain_check;
 
   const backups = scan.backups || [];
 
@@ -3052,14 +3053,27 @@ async function runAutoScan() {
       <div>
         <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:8px">Bitrix Sites (multi-site)</div>
         ${externalSites.length ? `<div style="color:#facc15;font-size:12px;margin-bottom:8px">⚠ ${externalSites.length} site(s) have a separate document root — back those up independently.</div>` : ''}
+        ${!currentSite ? `<div style="color:#64748b;font-size:12px;margin-bottom:8px">None of these match the domain used to load this page (${escHtml(location.hostname)}) — normal if you're accessing via an admin/temporary URL.</div>` : ''}
         <table style="width:100%;border-collapse:collapse;font-size:13px">
+          <tr>
+            <th style="text-align:left;color:#64748b;font-weight:500;padding:4px 8px 4px 0;font-size:11px">LID</th>
+            <th style="text-align:left;color:#64748b;font-weight:500;padding:4px 8px 4px 0;font-size:11px">Domain</th>
+            <th style="text-align:left;color:#64748b;font-weight:500;padding:4px 0;font-size:11px">Doc Root</th>
+          </tr>
           ${bitrixSites.map(s => `
             <tr>
-              <td style="color:#64748b;padding:4px 8px 4px 0;width:40px">${escHtml(s.site_id||'')}</td>
-              <td style="padding:4px 8px 4px 0;color:#e2e8f0">${escHtml(s.domain||'—')}</td>
-              <td style="padding:4px 0;font-family:monospace;font-size:11px;color:${s.is_current ? '#64748b' : '#facc15'}">${escHtml(s.doc_root||'(same as current)')}</td>
+              <td style="color:#64748b;padding:4px 8px 4px 0">${escHtml(s.site_id||'')}</td>
+              <td style="padding:4px 8px 4px 0;color:${s.is_current ? '#22c55e' : '#e2e8f0'}">${escHtml(s.domain||'—')}${s.is_current ? ' <span style="font-size:11px">← current</span>' : ''}</td>
+              <td style="padding:4px 0;font-family:monospace;font-size:11px;color:${s.external_root ? '#facc15' : '#64748b'}">${escHtml(s.doc_root||'(default)')}</td>
             </tr>`).join('')}
         </table>
+        ${domainCheck ? `
+        <div style="margin-top:10px;padding-top:10px;border-top:1px solid #2d3148;font-size:12px">
+          <span style="color:#64748b">main.server_name:</span> <span style="color:${domainCheck.mismatch ? '#ef4444' : '#e2e8f0'}">${escHtml(domainCheck.server_name || '(not set)')}</span>
+          ${domainCheck.mismatch
+            ? ` <span style="color:#ef4444">⚠ doesn't match resolved domain "${escHtml(domainCheck.resolved_domain)}" — a common cause of broken sessions.</span> <button class="btn btn-secondary btn-sm" onclick="fixBitrixDomain()" style="margin-left:4px">Fix</button>`
+            : ` <span style="color:#22c55e">✓ matches resolved domain</span>`}
+        </div>` : ''}
       </div>` : ''}
 
       ${(scan.sqls||[]).filter(s=>s.is_dump).length ? `
@@ -3208,40 +3222,15 @@ async function toggleDevMode() {
   renderDevModeStatus(fwData);
 }
 
-function renderBitrixDomainCheck(scan) {
-  const section = document.getElementById('bitrix-domain-check-section');
-  const table   = document.getElementById('bitrix-domain-table');
-  const fixWrap = document.getElementById('bitrix-domain-fix-wrap');
-  if (!section) return;
-
-  const check = scan.bitrix_domain_check;
-  if (!check) { section.style.display = 'none'; return; }
-  section.style.display = '';
-
-  const row = (label, value, color) => `<div style="margin-bottom:4px"><span style="color:#64748b">${label}:</span> <span style="color:${color || '#e2e8f0'}">${escHtml(value || '(not set)')}</span></div>`;
-  table.innerHTML =
-    row('main.server_name', check.server_name, check.mismatch ? '#ef4444' : '#e2e8f0') +
-    row('main.site_name', check.site_name) +
-    row('resolved (site list, fallback site_name)', check.resolved_domain, '#22c55e') +
-    (check.mismatch
-      ? `<div style="color:#ef4444;margin-top:6px">⚠ Mismatch — main.server_name does not match the resolved domain. This is a common cause of broken sessions.</div>`
-      : `<div style="color:#22c55e;margin-top:6px">✓ server_name matches the resolved domain.</div>`);
-
-  fixWrap.style.display = check.mismatch ? '' : 'none';
-}
-
 async function fixBitrixDomain() {
   if (!fwData.root) return;
   const check = fwData.bitrix_domain_check;
   if (!confirm(`Set main.server_name AND main.site_name to "${check?.resolved_domain}"?\n\nThis directly modifies the b_option table. Continue?`)) return;
-  const result = document.getElementById('bitrix-domain-fix-result');
-  result.textContent = 'Applying…';
   const r = await post('bitrix_fix_domain', {dir: fwData.root});
   if (!r.ok) {
-    result.textContent = '✗ ' + r.error;
+    alert('✗ ' + r.error);
     return;
   }
-  result.textContent = '✓ Set to ' + r.domain;
   runAutoScan();
 }
 
