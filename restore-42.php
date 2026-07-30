@@ -150,8 +150,8 @@ switch ($action) {
     case 'bitrix_login':
         handleBitrixAdminAuth();
         break;
-    case 'bitrix_verify_site':
-        handleBitrixVerifySite();
+    case 'bitrix_site_id_internal':
+        handleBitrixSiteIdInternal();
         break;
     case 'bitrix_toggle_devmode':
         handleBitrixToggleDevMode();
@@ -865,6 +865,11 @@ function handleScan(): void
     $bitrixSites   = $fw === 'bitrix' ? detectBitrixSites($dbCreds) : [];
     $bitrixDevMode = $fw === 'bitrix' ? getBitrixDevMode($dbCreds) : null;
     $bitrixDomain  = $fw === 'bitrix' ? detectBitrixDomainMismatch($dbCreds, $bitrixSites) : null;
+    // matched_by is 'domain' or 'fallback' at this point (set inside
+    // detectBitrixSites()) — the browser overrides this client-side with a
+    // 'kernel'-verified result via its own fetch() to bitrix_site_id_internal,
+    // since that self-request must happen from the browser, not server-side
+    // (see handleBitrixSiteIdInternal()'s doc comment for why).
 
     jsonOk([
         'root'              => $root,
@@ -2304,22 +2309,29 @@ function handleBitrixAdminAuth(): never
 /**
  * Ground truth for "which site is current", straight from Bitrix's own
  * kernel — bootstraps bitrix/header.php (output suppressed, no Authorize/
- * redirect) and reads the SITE_ID constant it resolves, rather than
- * reimplementing CSite::GetCurByDomain()'s matching/fallback rules
- * ourselves and hoping they're right. Explicit opt-in action only — NOT
- * run automatically on every scan, since bootstrapping the full kernel has
- * real side effects (analytics hits, agent crons, etc.) that shouldn't fire
- * silently and repeatedly.
+ * redirect) and echoes the SITE_ID constant it resolves as plain text.
+ *
+ * PHP cannot "unload" an include — once header.php runs, its classes/
+ * constants/globals are permanent for the rest of THIS process — so this
+ * must never run inside the same request that then goes on to do more
+ * work. Instead it's a normal authenticated action, called directly by the
+ * BROWSER as a separate request (plain fetch()), which is handled by a
+ * fresh PHP-FPM worker / Apache child with its own process memory. This
+ * sidesteps every server-side self-request mechanism (exec/shell_exec,
+ * curl, allow_url_fopen) — all routinely disabled via disable_functions on
+ * exactly the shared hosting this tool targets — since the browser's own
+ * networking is used instead, which is always available.
  */
-function handleBitrixVerifySite(): void
+function handleBitrixSiteIdInternal(): never
 {
+    header('Content-Type: text/plain');
     $docRoot = rtrim($_SERVER['DOCUMENT_ROOT'] ?? '', '/');
     $header  = $docRoot !== '' ? $docRoot . '/bitrix/header.php' : '';
     if ($header === '' || !file_exists($header)) {
         $header = __DIR__ . '/bitrix/header.php';
     }
     if (!file_exists($header)) {
-        jsonErr('bitrix/header.php not found — this script is not sitting inside a Bitrix site root.');
+        exit; // empty body — caller treats as "could not verify"
     }
     if (!defined('NO_KEEP_STATISTIC')) {
         define('NO_KEEP_STATISTIC', true);
@@ -2331,14 +2343,13 @@ function handleBitrixVerifySite(): void
         ob_start();
         require $header;
         ob_end_clean();
+        echo defined('SITE_ID') ? SITE_ID : '';
     } catch (Throwable $e) {
-        ob_end_clean();
-        jsonErr('Failed to bootstrap Bitrix kernel: ' . $e->getMessage());
+        if (ob_get_level() > 0) {
+            ob_end_clean();
+        }
     }
-    if (!defined('SITE_ID')) {
-        jsonErr('Bitrix bootstrapped, but SITE_ID was not defined');
-    }
-    jsonOk(['site_id' => SITE_ID]);
+    exit;
 }
 
 // ── HTML / UI ─────────────────────────────────────────────────────────────────
@@ -3015,6 +3026,31 @@ async function runAutoScan() {
     return;
   }
 
+  // Ground truth for "which Bitrix site is current", straight from Bitrix's
+  // own kernel — the browser fetches this directly (not the server), since
+  // a server-side self-request would depend on exec/curl/allow_url_fopen,
+  // all routinely disabled on the shared hosting this tool targets, whereas
+  // the browser's own networking is always available. Never throws; on any
+  // failure the DB-query heuristic (domain match / first-enabled fallback)
+  // computed server-side in scan.bitrix_sites is left untouched.
+  if (scan.framework === 'bitrix' && (scan.bitrix_sites || []).length) {
+    try {
+      const siteId = await fetch(API('bitrix_site_id_internal')).then(r => r.ok ? r.text() : '');
+      const trimmed = siteId.trim();
+      if (trimmed && scan.bitrix_sites.some(s => s.site_id === trimmed)) {
+        scan.bitrix_sites.forEach(s => {
+          s.is_current = s.site_id === trimmed;
+          s.matched_by = s.site_id === trimmed ? 'kernel' : null;
+        });
+        scan.bitrix_kernel_verified = true;
+      } else {
+        scan.bitrix_kernel_verified = false;
+      }
+    } catch (e) {
+      scan.bitrix_kernel_verified = false;
+    }
+  }
+
   fwData = scan;
 
   // Update shared state & form pre-fills (same as after extract)
@@ -3172,32 +3208,37 @@ async function runAutoScan() {
           <div style="background:#0f1117;border:1px solid #2d3148;border-radius:8px;padding:14px">
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
               <div style="font-size:13px;font-weight:700;color:#ffffff">🌐 Sites <span style="font-weight:400;color:#64748b;font-size:11px">(b_lang)</span></div>
-              <button class="btn btn-secondary btn-sm" onclick="verifyBitrixSite()">Verify via Bitrix core</button>
+              <button class="btn btn-secondary btn-sm" onclick="verifyBitrixSite()">Re-verify via Bitrix core</button>
             </div>
-            <p style="font-size:12px;color:#64748b;margin-bottom:10px">Bitrix always resolves every request to some site — MATCHED below is our best-effort guess (domain match, or the first enabled site as fallback). Click "Verify via Bitrix core" to get the real answer straight from Bitrix's own kernel.</p>
+            ${scan.bitrix_kernel_verified ? `
+              <div style="background:#052e2255;border:1px solid #4ade80;border-radius:6px;padding:8px 12px;color:#bbf7d0;font-size:13px;margin-bottom:10px">✓ ACTIVE below is confirmed directly from Bitrix's own kernel (SITE_ID) — not a guess.</div>
+            ` : `
+              <div style="background:#78350f55;border:1px solid #facc15;border-radius:6px;padding:8px 12px;color:#fde68a;font-size:13px;margin-bottom:10px">⚠ Could not verify the active site via Bitrix's kernel (bootstrap failed, or bitrix/header.php wasn't found here). ACTIVE/DEFAULT below are a best-effort guess only — a real domain match, or the first enabled site as fallback if none matched.</div>
+            `}
             <div id="bitrix-verify-result" style="font-size:12px;margin-bottom:10px"></div>
             ${externalSites.length ? `<div style="background:#78350f55;border:1px solid #facc15;border-radius:6px;padding:8px 12px;color:#fde68a;font-size:13px;margin-bottom:10px">⚠ ${externalSites.length} site(s) have a separate document root — back those up independently.</div>` : ''}
             <table style="width:100%;border-collapse:separate;border-spacing:0 8px">
               ${bitrixSites.map(s => {
+                const isActive = s.is_current && (s.matched_by === 'domain' || s.matched_by === 'kernel');
                 const isFallback = s.is_current && s.matched_by === 'fallback';
-                const border = s.is_current ? (s.matched_by === 'domain' ? '#4ade80' : '#f97316') : '#2d3148';
-                const bg = s.is_current ? (s.matched_by === 'domain' ? '#052e2255' : '#7c2d1233') : '#1a1d27';
+                const border = isActive ? '#4ade80' : (isFallback ? '#f97316' : '#2d3148');
+                const bg = isActive ? '#052e2255' : (isFallback ? '#7c2d1233' : '#1a1d27');
                 return `
                 <tr id="bitrix-site-row-${escHtml(s.site_id)}" style="background:${bg}">
                   <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};border-left:1px solid ${border};border-radius:8px 0 0 8px;padding:10px 12px;width:1%;white-space:nowrap">
                     <span style="font-family:monospace;font-size:12px;color:#94a3b8;background:#0f1117;border-radius:4px;padding:2px 8px">${escHtml(s.site_id||'')}</span>
                   </td>
-                  <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};padding:10px 12px;font-size:14px;font-weight:700;color:${s.is_current ? '#e2e8f0' : '#e2e8f0'}">
+                  <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};padding:10px 12px;font-size:14px;font-weight:700;color:#e2e8f0">
                     ${escHtml(s.domain || '(no domain set)')}
                   </td>
                   <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};padding:10px 12px;width:1%;white-space:nowrap;font-size:11px;font-weight:700;color:${s.active ? '#4ade80' : '#ef4444'}" title="b_lang.ACTIVE — is this site row enabled at all">
                     ${s.active ? '● ENABLED' : '● DISABLED'}
                   </td>
                   <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};padding:10px 12px;width:1%;white-space:nowrap">
-                    ${s.is_current && s.matched_by === 'domain' ? `<span style="font-size:11px;font-weight:700;color:#052e22;background:#4ade80;border-radius:4px;padding:2px 8px">MATCHED</span>` : ''}
+                    ${isActive ? `<span style="font-size:11px;font-weight:700;color:#052e22;background:#4ade80;border-radius:4px;padding:2px 8px">ACTIVE${s.matched_by === 'kernel' ? ' ✓' : ''}</span>` : ''}
                   </td>
                   <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};padding:10px 12px;width:1%;white-space:nowrap">
-                    ${isFallback ? `<span style="font-size:11px;font-weight:700;color:#ffffff;background:#f97316;border-radius:4px;padding:2px 8px">FALLBACK</span>` : ''}
+                    ${isFallback ? `<span style="font-size:11px;font-weight:700;color:#ffffff;background:#f97316;border-radius:4px;padding:2px 8px">DEFAULT</span>` : ''}
                   </td>
                   <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};border-right:1px solid ${border};border-radius:0 8px 8px 0;padding:10px 12px;width:1%;white-space:nowrap;font-family:monospace;font-size:11px;color:${s.external_root ? '#facc15' : 'transparent'}">
                     ${s.external_root ? escHtml(s.doc_root) : ''}
@@ -3369,20 +3410,13 @@ async function fixBitrixDomain() {
 }
 
 async function verifyBitrixSite() {
+  // Kernel verification already runs automatically as part of every scan
+  // (runAutoScan() fetches bitrix_site_id_internal directly) — this button
+  // just re-triggers a fresh scan, useful if the first attempt failed
+  // transiently or after applying a fix.
   const result = document.getElementById('bitrix-verify-result');
-  result.innerHTML = '<span style="color:#94a3b8">Bootstrapping Bitrix kernel…</span>';
-  const r = await post('bitrix_verify_site', {});
-  if (!r.ok) {
-    result.innerHTML = `<span style="color:#ef4444">✗ ${escHtml(r.error)}</span>`;
-    return;
-  }
-  const guessedRight = fwData.bitrix_sites?.find(s => s.is_current)?.site_id === r.site_id;
-  result.innerHTML = `<span style="color:#4ade80">✓ Bitrix's kernel resolved this request to site "${escHtml(r.site_id)}"</span>` +
-    (guessedRight ? ` <span style="color:#64748b">— matches our own guess above.</span>` : ` <span style="color:#facc15">— differs from our guess above! Trusting this over the heuristic.</span>`);
-  // Highlight the confirmed row directly
-  document.querySelectorAll('[id^="bitrix-site-row-"]').forEach(row => row.style.outline = '');
-  const confirmedRow = document.getElementById('bitrix-site-row-' + r.site_id);
-  if (confirmedRow) confirmedRow.style.outline = '2px solid #4ade80';
+  result.innerHTML = '<span style="color:#94a3b8">Re-checking…</span>';
+  await runAutoScan();
 }
 
 // ── SQL Console — tabbed, persisted to localStorage ────────────────────────────
