@@ -7,7 +7,7 @@
  */
 
 define('RESTORE_VERSION', '1.0.0');
-define('STORED_PASS_HASH', '$2y$10$PAJtcKFXeDLxaWmaJWfNiuQZJySIZaio4nUzddNMxWqtcw0uRQaye'); // self-updated on first login — do not edit this line
+define('STORED_PASS_HASH', ''); // self-updated on first login — do not edit this line
 define('WORK_DIR', __DIR__ . '/.restore');
 define('UPLOADS_DIR', WORK_DIR . '/uploads');
 define('EXTRACT_DIR', WORK_DIR . '/extract');
@@ -87,10 +87,16 @@ switch ($action) {
     case 'check_auth':
         $authMode = STORED_PASS_HASH === '' ? 'first_run'
                   : (str_starts_with(STORED_PASS_HASH, 'bitrix:') ? 'bitrix' : 'local');
+        // Only disclose whether Bitrix is actually present when the account is
+        // already IN bitrix-auth mode (needed to detect a broken/moved install
+        // and show the recovery message) — otherwise this is an unauthenticated
+        // endpoint and shouldn't hand anonymous callers free tech-stack recon.
+        // The login screen always offers the Bitrix option regardless; a wrong
+        // guess there just fails cleanly.
         jsonOk([
             'auth'             => isAuth(),
             'mode'             => $authMode,
-            'bitrix_available' => detectBitrixPresent(),
+            'bitrix_available' => $authMode === 'bitrix' ? detectBitrixPresent() : true,
         ]);
         break;
     case 'upload':
@@ -274,8 +280,8 @@ function verifyBitrixAdminPassword(string $pw): bool
     }
 
     try {
-        $pdo  = dbConnect($c['host'], $c['user'], $c['pass'] ?? '', (int)($c['port'] ?? 3306), $c['db']);
-        $row  = $pdo->query("SELECT `PASSWORD` FROM `b_user` WHERE `ID` = 1 AND `ACTIVE` = 'Y' LIMIT 1")->fetch(PDO::FETCH_ASSOC);
+        $conn = dbConnect($c['host'], $c['user'], $c['pass'] ?? '', (int)($c['port'] ?? 3306), $c['db']);
+        $row  = $conn->query("SELECT `PASSWORD` FROM `b_user` WHERE `ID` = 1 AND `ACTIVE` = 'Y' LIMIT 1")->fetch_assoc();
         $stored = $row['PASSWORD'] ?? '';
         if ($stored === '') {
             return false;
@@ -1129,14 +1135,14 @@ function getServerEnvironment(): array
         // nginx ignores .htaccess entirely and needs an explicit config rule.
         'is_nginx'        => str_contains(strtolower($sw), 'nginx'),
         'extensions'  => [
-            'pdo_mysql' => extension_loaded('pdo_mysql'),
+            'mysqli'    => extension_loaded('mysqli'),
             'zip'       => extension_loaded('zip'),
             'mbstring'  => extension_loaded('mbstring'),
             'phar'      => extension_loaded('phar'),
         ],
         // exec()/shell_exec() etc. back the tar/mysqldump/mysql CLI paths —
         // hosts often disable these via php.ini's disable_functions, in which
-        // case only the PharData/PDO fallbacks work.
+        // case only the PharData/mysqli fallbacks work.
         'functions' => [
             'exec'       => phpFunctionAvailable('exec'),
             'shell_exec' => phpFunctionAvailable('shell_exec'),
@@ -1167,14 +1173,14 @@ function detectBitrixSites(array $dbCreds): array
         return [];
     }
     try {
-        $pdo = dbConnect(
+        $conn = dbConnect(
             $dbCreds['db_host'],
             $dbCreds['db_user'] ?? '',
             $dbCreds['db_pass'] ?? '',
             (int)($dbCreds['db_port'] ?? 3306),
             $dbCreds['db_name']
         );
-        $rows = $pdo->query("SELECT LID, SERVER_NAME, DOC_ROOT FROM b_lang")->fetchAll(PDO::FETCH_ASSOC);
+        $rows = $conn->query("SELECT LID, SERVER_NAME, DOC_ROOT FROM b_lang")->fetch_all(MYSQLI_ASSOC);
         return array_map(fn($r) => [
             'site_id'    => $r['LID'],
             'domain'     => $r['SERVER_NAME'],
@@ -1201,16 +1207,15 @@ function getBitrixDevMode(array $dbCreds): ?string
         return null;
     }
     try {
-        $pdo = dbConnect(
+        $conn = dbConnect(
             $dbCreds['db_host'],
             $dbCreds['db_user'] ?? '',
             $dbCreds['db_pass'] ?? '',
             (int)($dbCreds['db_port'] ?? 3306),
             $dbCreds['db_name']
         );
-        $stmt = $pdo->query("SELECT VALUE FROM b_option WHERE MODULE_ID = 'main' AND NAME = 'update_devsrv' LIMIT 1");
-        $val  = $stmt->fetchColumn();
-        return $val === false ? null : (string)$val;
+        $row = $conn->query("SELECT VALUE FROM b_option WHERE MODULE_ID = 'main' AND NAME = 'update_devsrv' LIMIT 1")->fetch_row();
+        return $row === null ? null : (string)$row[0];
     } catch (Throwable $e) {
         return null;
     }
@@ -1228,16 +1233,18 @@ function handleBitrixToggleDevMode(): void
         jsonErr('Could not resolve Bitrix DB credentials');
     }
     try {
-        $pdo  = dbConnect($dbCreds['db_host'], $dbCreds['db_user'] ?? '', $dbCreds['db_pass'] ?? '', (int)($dbCreds['db_port'] ?? 3306), $dbCreds['db_name']);
-        $stmt = $pdo->query("SELECT VALUE FROM b_option WHERE MODULE_ID = 'main' AND NAME = 'update_devsrv' LIMIT 1");
-        $old  = $stmt->fetchColumn();
+        $conn = dbConnect($dbCreds['db_host'], $dbCreds['db_user'] ?? '', $dbCreds['db_pass'] ?? '', (int)($dbCreds['db_port'] ?? 3306), $dbCreds['db_name']);
+        $row  = $conn->query("SELECT VALUE FROM b_option WHERE MODULE_ID = 'main' AND NAME = 'update_devsrv' LIMIT 1")->fetch_row();
+        $old  = $row === null ? null : $row[0];
         $new  = ($old === 'Y') ? 'N' : 'Y';
-        if ($old === false) {
-            $pdo->prepare("INSERT INTO b_option (MODULE_ID, NAME, VALUE) VALUES ('main', 'update_devsrv', ?)")->execute([$new]);
+        if ($old === null) {
+            $stmt = $conn->prepare("INSERT INTO b_option (MODULE_ID, NAME, VALUE) VALUES ('main', 'update_devsrv', ?)");
         } else {
-            $pdo->prepare("UPDATE b_option SET VALUE = ? WHERE MODULE_ID = 'main' AND NAME = 'update_devsrv'")->execute([$new]);
+            $stmt = $conn->prepare("UPDATE b_option SET VALUE = ? WHERE MODULE_ID = 'main' AND NAME = 'update_devsrv'");
         }
-        jsonOk(['old' => $old === false ? null : $old, 'new' => $new]);
+        $stmt->bind_param('s', $new);
+        $stmt->execute();
+        jsonOk(['old' => $old, 'new' => $new]);
     } catch (Throwable $e) {
         jsonErr('DB error: ' . $e->getMessage());
     }
@@ -1412,27 +1419,45 @@ function sqlScore(string $path, string $name): int
 
 // ── Database ──────────────────────────────────────────────────────────────────
 
-function dbConnect(string $host, string $user, string $pass, int $port, string $db = ''): PDO
+/**
+ * Native mysqli connection — Bitrix's own DB layer (CDatabase) uses mysqli
+ * directly, not PDO, so hosts with mysqli but no pdo_mysql are common and
+ * otherwise fully functional for Bitrix itself. Exception-mode reporting is
+ * enabled so query()/prepare()/execute() throw on failure, matching every
+ * existing try/catch(Throwable) call site without further changes there.
+ * mysqli::query() only ever executes a single statement (multi-statement
+ * execution requires the separate multi_query()), which gives us the same
+ * "one statement per call" safety PDO's MYSQL_ATTR_MULTI_STATEMENTS=false
+ * provided, with no extra flag needed.
+ */
+function dbConnect(string $host, string $user, string $pass, int $port, string $db = ''): mysqli
 {
-    $dsn = "mysql:host={$host};port={$port};charset=utf8mb4" . ($db ? ";dbname={$db}" : '');
-    return new PDO($dsn, $user, $pass, [
-        PDO::ATTR_ERRMODE              => PDO::ERRMODE_EXCEPTION,
-        PDO::ATTR_TIMEOUT              => 5,
-        PDO::MYSQL_ATTR_MULTI_STATEMENTS => false,
-    ]);
+    if (!class_exists('mysqli')) {
+        throw new RuntimeException(
+            "PHP's mysqli extension is not enabled on this server — DB features " .
+            '(credential test, SQL Console, Bitrix tools) are unavailable. ' .
+            'Ask your host to enable the mysqli extension.'
+        );
+    }
+    mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
+    $conn = mysqli_init();
+    $conn->options(MYSQLI_OPT_CONNECT_TIMEOUT, 5);
+    $conn->real_connect($host, $user, $pass, $db !== '' ? $db : null, $port);
+    $conn->set_charset('utf8mb4');
+    return $conn;
 }
 
 function handleTestDb(): void
 {
     try {
-        $pdo = dbConnect(
+        $conn = dbConnect(
             $_POST['db_host'] ?? 'localhost',
             $_POST['db_user'] ?? '',
             $_POST['db_pass'] ?? '',
             (int)($_POST['db_port'] ?? 3306),
             $_POST['db_name'] ?? ''
         );
-        $ver = $pdo->query('SELECT VERSION()')->fetchColumn();
+        $ver = $conn->query('SELECT VERSION()')->fetch_row()[0];
         jsonOk(['version' => $ver]);
     } catch (Throwable $e) {
         error_log('restore-42.php DB connect error: ' . $e->getMessage());
@@ -1442,10 +1467,11 @@ function handleTestDb(): void
 
 /**
  * Notebook-style ad-hoc SQL execution against a caller-supplied connection.
- * One statement per call — MYSQL_ATTR_MULTI_STATEMENTS is disabled in
- * dbConnect(), matching the "one cell = one statement" notebook model.
- * This tool already assumes a single trusted admin behind the login
- * password; arbitrary SQL here is the intended capability, not a hole.
+ * One statement per call — mysqli::query() only ever executes a single
+ * statement (multi-statement requires the separate multi_query()), matching
+ * the "one cell = one statement" notebook model. This tool already assumes
+ * a single trusted admin behind the login password; arbitrary SQL here is
+ * the intended capability, not a hole.
  */
 function handleRunSql(): void
 {
@@ -1454,22 +1480,19 @@ function handleRunSql(): void
         jsonErr('Empty query');
     }
     try {
-        $pdo = dbConnect(
+        $conn = dbConnect(
             $_POST['host'] ?? 'localhost',
             $_POST['user'] ?? '',
             $_POST['pass'] ?? '',
             (int)($_POST['port'] ?? 3306),
             $_POST['db'] ?? ''
         );
-        $stmt = $pdo->query($query);
-        if ($stmt === false) {
-            jsonErr('Query failed');
-        }
-        if ($stmt->columnCount() > 0) {
+        $result = $conn->query($query);
+        if ($result instanceof mysqli_result) {
             $rows = [];
             $truncated = false;
             $i = 0;
-            while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+            while ($row = $result->fetch_assoc()) {
                 if ($i++ >= 500) {
                     $truncated = true;
                     break;
@@ -1478,7 +1501,7 @@ function handleRunSql(): void
             }
             jsonOk(['rows' => $rows, 'truncated' => $truncated]);
         } else {
-            jsonOk(['affected' => $stmt->rowCount()]);
+            jsonOk(['affected' => $conn->affected_rows]);
         }
     } catch (Throwable $e) {
         jsonErr($e->getMessage());
@@ -1508,15 +1531,15 @@ function handleImportSql(): void
     }
 
     try {
-        $pdo = dbConnect($host, $user, $pass, $port);
+        $conn = dbConnect($host, $user, $pass, $port);
         if ($db) {
             if (!empty($_POST['clean_db'])) {
-                $pdo->exec("DROP DATABASE IF EXISTS `{$db}`");
-                $pdo->exec("CREATE DATABASE `{$db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+                $conn->query("DROP DATABASE IF EXISTS `{$db}`");
+                $conn->query("CREATE DATABASE `{$db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
             } elseif (!empty($_POST['create_db'])) {
-                $pdo->exec("CREATE DATABASE IF NOT EXISTS `{$db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+                $conn->query("CREATE DATABASE IF NOT EXISTS `{$db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
             }
-            $pdo->exec("USE `{$db}`");
+            $conn->query("USE `{$db}`");
         }
     } catch (Throwable $e) {
         jsonErr('DB connect: ' . $e->getMessage());
@@ -1536,15 +1559,14 @@ function handleImportSql(): void
         if ($ret === 0) {
             jsonOk(['method' => 'cli']);
         }
-        // Fall through to PDO on failure
+        // Fall through to mysqli import on failure
     }
 
-    // PDO import
-    importViaPdo($pdo, $real);
-    jsonOk(['method' => 'pdo']);
+    importViaMysqli($conn, $real);
+    jsonOk(['method' => 'mysqli']);
 }
 
-function importViaPdo(PDO $pdo, string $file): void
+function importViaMysqli(mysqli $conn, string $file): void
 {
     $gz   = str_ends_with(strtolower($file), '.gz');
     $fh   = $gz ? gzopen($file, 'r') : fopen($file, 'r');
@@ -1575,7 +1597,7 @@ function importViaPdo(PDO $pdo, string $file): void
             $q = trim(substr($buf, 0, -strlen($delim)));
             if ($q) {
                 try {
-                    $pdo->exec($q);
+                    $conn->query($q);
                 } catch (Throwable $e) {
                     error_log('SQL: ' . $e->getMessage());
                 }

@@ -7,7 +7,7 @@ RUN usermod -u "${UID}" www-data && groupmod -g "${GID}" www-data
 
 RUN apt-get update -q && apt-get install -y -q --no-install-recommends \
         unzip mariadb-client libzip-dev \
-    && docker-php-ext-install pdo pdo_mysql zip \
+    && docker-php-ext-install mysqli zip \
     && a2enmod rewrite \
     && rm -rf /var/lib/apt/lists/*
 
