@@ -880,6 +880,7 @@ function handleScan(): void
         'bitrix_sites'      => $bitrixSites,
         'bitrix_dev_mode'   => $bitrixDevMode,
         'bitrix_domain_check' => $bitrixDomain,
+        'current_host'      => $fw === 'bitrix' ? currentRequestHost() : null,
     ]);
 }
 
@@ -1172,6 +1173,23 @@ function getServerEnvironment(): array
  * plain backup of __DIR__ would NOT capture — surfaced so the user knows to
  * back it up too.
  */
+/**
+ * Normalize a hostname for comparison: strip a port suffix (HTTP_HOST
+ * includes it for non-default ports) and a leading "www." (an extremely
+ * common real-world mismatch — site bound without www but reached with it,
+ * or vice versa).
+ */
+function normalizeHost(string $h): string
+{
+    return preg_replace('/^www\./', '', strtolower(explode(':', $h)[0]));
+}
+
+/** The domain this request actually arrived on, normalized for comparison. */
+function currentRequestHost(): string
+{
+    return normalizeHost($_SERVER['HTTP_HOST'] ?? '');
+}
+
 function detectBitrixSites(array $dbCreds): array
 {
     if (empty($dbCreds['db_host']) || empty($dbCreds['db_name'])) {
@@ -1185,21 +1203,27 @@ function detectBitrixSites(array $dbCreds): array
             (int)($dbCreds['db_port'] ?? 3306),
             $dbCreds['db_name']
         );
-        $rows = $conn->query("SELECT LID, SERVER_NAME, DOC_ROOT FROM b_lang")->fetch_all(MYSQLI_ASSOC);
+        $rows = $conn->query("SELECT LID, SERVER_NAME, DOC_ROOT, ACTIVE FROM b_lang")->fetch_all(MYSQLI_ASSOC);
         // "Current" means this site's SERVER_NAME matches the domain this page
-        // was actually loaded from — the same match Bitrix itself performs
-        // (CSite::GetCurByDomain). DOC_ROOT is usually empty for every site in a
-        // single-docroot install, so it's useless for telling sites apart; it's
-        // only meaningful for flagging a genuinely SEPARATE document root below.
-        $currentHost = strtolower((string)($_SERVER['HTTP_HOST'] ?? ''));
+        // was actually loaded from AND the site is active — the same match
+        // Bitrix itself performs (CSite::GetCurByDomain skips inactive sites).
+        // DOC_ROOT is usually empty for every site in a single-docroot install,
+        // so it's useless for telling sites apart; it's only meaningful for
+        // flagging a genuinely SEPARATE document root below.
+        $currentHost = currentRequestHost();
         return array_map(function ($r) use ($currentHost) {
             $docRoot = (string)$r['DOC_ROOT'];
+            $active  = $r['ACTIVE'] === 'Y';
             return [
                 'site_id'       => $r['LID'],
                 'domain'        => $r['SERVER_NAME'],
                 'doc_root'      => $docRoot,
-                'is_current'    => $r['SERVER_NAME'] !== '' && strtolower($r['SERVER_NAME']) === $currentHost,
+                'active'        => $active,
+                'is_current'    => $active && $r['SERVER_NAME'] !== '' && normalizeHost($r['SERVER_NAME']) === $currentHost,
                 'external_root' => $docRoot !== '' && rtrim($docRoot, '/') !== rtrim(__DIR__, '/'),
+                // Bitrix's conventional default site ID — shown as a fallback
+                // reference point when no site matches the current host at all.
+                'is_default'    => $active && $r['LID'] === 's1',
             ];
         }, $rows ?: []);
     } catch (Throwable $e) {
@@ -3050,30 +3074,70 @@ async function runAutoScan() {
       </div>` : hasFiles ? `<div style="color:#64748b;font-size:13px">No DB credentials found in config files.</div>` : ''}
 
       ${bitrixSites.length ? `
-      <div>
-        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:8px">Bitrix Sites (multi-site)</div>
-        ${externalSites.length ? `<div style="color:#facc15;font-size:12px;margin-bottom:8px">⚠ ${externalSites.length} site(s) have a separate document root — back those up independently.</div>` : ''}
-        ${!currentSite ? `<div style="color:#64748b;font-size:12px;margin-bottom:8px">None of these match the domain used to load this page (${escHtml(location.hostname)}) — normal if you're accessing via an admin/temporary URL.</div>` : ''}
-        <table style="width:100%;border-collapse:collapse;font-size:13px">
-          <tr>
-            <th style="text-align:left;color:#64748b;font-weight:500;padding:4px 8px 4px 0;font-size:11px">LID</th>
-            <th style="text-align:left;color:#64748b;font-weight:500;padding:4px 8px 4px 0;font-size:11px">Domain</th>
-            <th style="text-align:left;color:#64748b;font-weight:500;padding:4px 0;font-size:11px">Doc Root</th>
-          </tr>
-          ${bitrixSites.map(s => `
-            <tr>
-              <td style="color:#64748b;padding:4px 8px 4px 0">${escHtml(s.site_id||'')}</td>
-              <td style="padding:4px 8px 4px 0;color:${s.is_current ? '#22c55e' : '#e2e8f0'}">${escHtml(s.domain||'—')}${s.is_current ? ' <span style="font-size:11px">← current</span>' : ''}</td>
-              <td style="padding:4px 0;font-family:monospace;font-size:11px;color:${s.external_root ? '#facc15' : '#64748b'}">${escHtml(s.doc_root||'(default)')}</td>
-            </tr>`).join('')}
-        </table>
-        ${domainCheck ? `
-        <div style="margin-top:10px;padding-top:10px;border-top:1px solid #2d3148;font-size:12px">
-          <span style="color:#64748b">main.server_name:</span> <span style="color:${domainCheck.mismatch ? '#ef4444' : '#e2e8f0'}">${escHtml(domainCheck.server_name || '(not set)')}</span>
-          ${domainCheck.mismatch
-            ? ` <span style="color:#ef4444">⚠ doesn't match resolved domain "${escHtml(domainCheck.resolved_domain)}" — a common cause of broken sessions.</span> <button class="btn btn-secondary btn-sm" onclick="fixBitrixDomain()" style="margin-left:4px">Fix</button>`
-            : ` <span style="color:#22c55e">✓ matches resolved domain</span>`}
-        </div>` : ''}
+      <div style="background:linear-gradient(135deg, #064e3b, #0d9488 55%, #f0fdfa); border-radius:12px; padding:2px">
+        <div style="background:#11141dee; border-radius:10px; padding:16px">
+
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#5eead4;margin-bottom:10px;font-weight:700">Bitrix — Domain Diagnosis</div>
+
+          <!-- Section 1: Main Module Settings -->
+          <div style="background:#0f1117;border:1px solid #2d3148;border-radius:8px;padding:14px;margin-bottom:12px">
+            <div style="font-size:13px;font-weight:700;color:#ffffff;margin-bottom:4px">📋 Main Module Settings <span style="font-weight:400;color:#64748b;font-size:11px">(b_option)</span></div>
+            <p style="font-size:12px;color:#94a3b8;margin-bottom:12px;line-height:1.5">These two values are both stored in Bitrix's own config and should agree with each other — unrelated to how you're browsing this admin tool right now.</p>
+            ${domainCheck ? `
+              <div style="display:flex;flex-wrap:wrap;gap:20px;margin-bottom:10px">
+                <div>
+                  <div style="font-size:11px;color:#94a3b8;margin-bottom:3px">server_name</div>
+                  <div style="font-family:monospace;font-size:14px;font-weight:700;color:${domainCheck.mismatch ? '#f87171' : '#4ade80'}">${escHtml(domainCheck.server_name || '(not set)')}</div>
+                </div>
+                <div>
+                  <div style="font-size:11px;color:#94a3b8;margin-bottom:3px">site_name</div>
+                  <div style="font-family:monospace;font-size:14px;font-weight:700;color:#e2e8f0">${escHtml(domainCheck.site_name || '(not set)')}</div>
+                </div>
+                <div>
+                  <div style="font-size:11px;color:#94a3b8;margin-bottom:3px">expected (from site list)</div>
+                  <div style="font-family:monospace;font-size:14px;font-weight:700;color:#5eead4">${escHtml(domainCheck.resolved_domain || '?')}</div>
+                </div>
+              </div>
+              ${domainCheck.mismatch ? `
+                <div style="background:#7f1d1d55;border:1px solid #f87171;border-radius:6px;padding:10px 12px;color:#fecaca;font-size:13px;line-height:1.6">
+                  ⚠ <strong>server_name ("${escHtml(domainCheck.server_name)}") does not match site_name / the site's bound domain ("${escHtml(domainCheck.resolved_domain)}").</strong>
+                  Bitrix internally thinks this installation lives at <strong>${escHtml(domainCheck.server_name)}</strong>, but the site is actually configured for <strong>${escHtml(domainCheck.resolved_domain)}</strong>. This disagreement between the two stored values is a documented cause of broken sessions.
+                  <div style="margin-top:8px"><button class="btn btn-primary btn-sm" onclick="fixBitrixDomain()">Set server_name to "${escHtml(domainCheck.resolved_domain)}"</button></div>
+                </div>` : `
+                <div style="background:#052e2255;border:1px solid #4ade80;border-radius:6px;padding:8px 12px;color:#bbf7d0;font-size:13px">✓ server_name matches site_name / the site's bound domain — no mismatch here.</div>`}
+            ` : `<div style="color:#94a3b8;font-size:13px">Could not read b_option (connection failed or credentials missing).</div>`}
+          </div>
+
+          <!-- Section 2: Sites -->
+          <div style="background:#0f1117;border:1px solid #2d3148;border-radius:8px;padding:14px">
+            <div style="font-size:13px;font-weight:700;color:#ffffff;margin-bottom:10px">🌐 Sites <span style="font-weight:400;color:#64748b;font-size:11px">(b_lang)</span></div>
+            ${externalSites.length ? `<div style="background:#78350f55;border:1px solid #facc15;border-radius:6px;padding:8px 12px;color:#fde68a;font-size:13px;margin-bottom:10px">⚠ ${externalSites.length} site(s) have a separate document root — back those up independently.</div>` : ''}
+            <table style="width:100%;border-collapse:separate;border-spacing:0 8px">
+              ${bitrixSites.map(s => {
+                const isDefaultBadge = !s.is_current && s.is_default;
+                const border = s.is_current ? '#4ade80' : (isDefaultBadge ? '#f97316' : '#2d3148');
+                const bg = s.is_current ? '#052e2255' : (isDefaultBadge ? '#7c2d1233' : '#1a1d27');
+                return `
+                <tr style="background:${bg}">
+                  <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};border-left:1px solid ${border};border-radius:8px 0 0 8px;padding:10px 12px;width:1%;white-space:nowrap">
+                    <span style="font-family:monospace;font-size:12px;color:#94a3b8;background:#0f1117;border-radius:4px;padding:2px 8px">${escHtml(s.site_id||'')}</span>
+                  </td>
+                  <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};padding:10px 12px;font-size:14px;font-weight:700;color:${s.is_current ? '#4ade80' : '#e2e8f0'}">
+                    ${escHtml(s.domain || '(no domain set)')}
+                  </td>
+                  <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};padding:10px 12px;width:1%;white-space:nowrap">
+                    ${s.is_current ? `<span style="font-size:11px;font-weight:700;color:#052e22;background:#4ade80;border-radius:4px;padding:2px 8px">ACTIVE</span>` : ''}
+                    ${isDefaultBadge ? `<span style="font-size:11px;font-weight:700;color:#ffffff;background:#f97316;border-radius:4px;padding:2px 8px">DEFAULT</span>` : ''}
+                  </td>
+                  <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};border-right:1px solid ${border};border-radius:0 8px 8px 0;padding:10px 12px;width:1%;white-space:nowrap;font-family:monospace;font-size:11px;color:${s.external_root ? '#facc15' : 'transparent'}">
+                    ${s.external_root ? escHtml(s.doc_root) : ''}
+                  </td>
+                </tr>`;
+              }).join('')}
+            </table>
+          </div>
+
+        </div>
       </div>` : ''}
 
       ${(scan.sqls||[]).filter(s=>s.is_dump).length ? `
