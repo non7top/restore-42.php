@@ -7,7 +7,7 @@
  */
 
 define('RESTORE_VERSION', '1.0.0');
-define('STORED_PASS_HASH', '$2y$10$Nop6joBTPF1twYUmMq0Z7OOQU2KBcy5K4Mw6u9R/NPr31Wub5hHnO'); // self-updated on first login — do not edit this line
+define('STORED_PASS_HASH', '$2y$10$PAJtcKFXeDLxaWmaJWfNiuQZJySIZaio4nUzddNMxWqtcw0uRQaye'); // self-updated on first login — do not edit this line
 define('WORK_DIR', __DIR__ . '/.restore');
 define('UPLOADS_DIR', WORK_DIR . '/uploads');
 define('EXTRACT_DIR', WORK_DIR . '/extract');
@@ -146,6 +146,9 @@ switch ($action) {
         break;
     case 'bitrix_toggle_devmode':
         handleBitrixToggleDevMode();
+        break;
+    case 'run_sql':
+        handleRunSql();
         break;
     case 'download_backup':
         handleDownloadBackup();
@@ -1437,6 +1440,51 @@ function handleTestDb(): void
     }
 }
 
+/**
+ * Notebook-style ad-hoc SQL execution against a caller-supplied connection.
+ * One statement per call — MYSQL_ATTR_MULTI_STATEMENTS is disabled in
+ * dbConnect(), matching the "one cell = one statement" notebook model.
+ * This tool already assumes a single trusted admin behind the login
+ * password; arbitrary SQL here is the intended capability, not a hole.
+ */
+function handleRunSql(): void
+{
+    $query = trim($_POST['query'] ?? '');
+    if ($query === '') {
+        jsonErr('Empty query');
+    }
+    try {
+        $pdo = dbConnect(
+            $_POST['host'] ?? 'localhost',
+            $_POST['user'] ?? '',
+            $_POST['pass'] ?? '',
+            (int)($_POST['port'] ?? 3306),
+            $_POST['db'] ?? ''
+        );
+        $stmt = $pdo->query($query);
+        if ($stmt === false) {
+            jsonErr('Query failed');
+        }
+        if ($stmt->columnCount() > 0) {
+            $rows = [];
+            $truncated = false;
+            $i = 0;
+            while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+                if ($i++ >= 500) {
+                    $truncated = true;
+                    break;
+                }
+                $rows[] = $row;
+            }
+            jsonOk(['rows' => $rows, 'truncated' => $truncated]);
+        } else {
+            jsonOk(['affected' => $stmt->rowCount()]);
+        }
+    } catch (Throwable $e) {
+        jsonErr($e->getMessage());
+    }
+}
+
 function handleImportSql(): void
 {
     $sqlFile = $_POST['sql_file'] ?? '';
@@ -2212,6 +2260,9 @@ select option{background:#1a1d27}
       <div class="nav-item" onclick="showTab('backup')" id="tab-backup">
         <span class="icon">📦</span> Backup
       </div>
+      <div class="nav-item" onclick="showTab('sqlconsole')" id="tab-sqlconsole">
+        <span class="icon">💻</span> SQL Console
+      </div>
     </div>
     <div style="padding:16px 20px;border-top:1px solid #2d3148">
       <button class="btn btn-secondary btn-sm" onclick="doLogout()" style="width:100%">Logout</button>
@@ -2487,6 +2538,34 @@ select option{background:#1a1d27}
         </div>
       </div>
 
+      <!-- ── SQL CONSOLE TAB ───────────────────────────────────── -->
+      <div id="pane-sqlconsole" style="display:none">
+        <div class="panel">
+          <div class="panel-title">SQL Console</div>
+          <div style="margin-bottom:12px">
+            <button class="btn btn-secondary btn-sm" onclick="useDetectedSqlCreds()">🔍 Use detected site creds</button>
+            <span style="font-size:12px;color:#64748b;margin-left:8px">or type your own connection below</span>
+          </div>
+          <div class="form-row">
+            <div class="form-group"><label>DB Host</label><input id="sql-host" value="localhost"></div>
+            <div class="form-group" style="flex:0 0 80px"><label>Port</label><input id="sql-port" value="3306"></div>
+            <div class="form-group"><label>DB User</label><input id="sql-user"></div>
+            <div class="form-group"><label>DB Password</label><input type="password" id="sql-pass"></div>
+            <div class="form-group"><label>DB Name</label><input id="sql-db"></div>
+          </div>
+
+          <div id="sql-cells" style="display:flex;flex-direction:column;gap:12px;margin-bottom:12px;max-height:520px;overflow-y:auto"></div>
+
+          <textarea id="sql-input" rows="4" placeholder="SELECT * FROM b_option WHERE MODULE_ID='main' LIMIT 20;&#10;&#10;One statement per cell — Ctrl+Enter (⌘+Enter) to run."
+                    style="width:100%;font-family:monospace;font-size:13px;background:#0f1117;border:1px solid #2d3148;border-radius:6px;padding:10px;color:#e2e8f0;resize:vertical"
+                    onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter'){event.preventDefault();runSqlCell();}"></textarea>
+          <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+            <button class="btn btn-primary" onclick="runSqlCell()">▶ Run <span style="opacity:.6;font-size:11px">(Ctrl+Enter)</span></button>
+            <button class="btn btn-secondary btn-sm" onclick="clearSqlCells()">Clear</button>
+          </div>
+        </div>
+      </div>
+
     </div><!-- /content -->
   </div><!-- /main -->
 </div><!-- /app -->
@@ -2747,6 +2826,9 @@ async function runAutoScan() {
   if (creds.db_user) document.getElementById('bk-user').value = creds.db_user;
   if (creds.db_pass) document.getElementById('bk-pass').value = creds.db_pass;
   if (creds.db_name) document.getElementById('bk-db').value = creds.db_name;
+  // SQL Console fields are NOT auto-filled here — use the explicit
+  // "Use detected creds" button so it never silently overwrites a
+  // custom connection the user is actively typing/using.
   // Persist to encrypted vault so next session auto-fills
   const hasCreds = Object.keys(creds).length > 0;
   const vaultSaved = hasCreds ? await vaultSave(creds) : false;
@@ -2962,6 +3044,72 @@ async function toggleDevMode() {
   el.textContent = r.ok ? r.new : '✗ ' + r.error;
 }
 
+// ── SQL Console ───────────────────────────────────────────────────────────────
+
+let sqlCellCount = 0;
+
+function useDetectedSqlCreds() {
+  const creds = fwData.db_credentials || {};
+  if (!Object.keys(creds).length) {
+    alert('No detected DB credentials available yet — run a scan first (Framework Info tab).');
+    return;
+  }
+  if (creds.db_host) document.getElementById('sql-host').value = creds.db_host;
+  if (creds.db_port) document.getElementById('sql-port').value = creds.db_port;
+  if (creds.db_user) document.getElementById('sql-user').value = creds.db_user;
+  if (creds.db_pass) document.getElementById('sql-pass').value = creds.db_pass;
+  if (creds.db_name) document.getElementById('sql-db').value = creds.db_name;
+}
+
+async function runSqlCell() {
+  const input = document.getElementById('sql-input');
+  const query = input.value.trim();
+  if (!query) return;
+
+  const cells = document.getElementById('sql-cells');
+  const id = ++sqlCellCount;
+  cells.insertAdjacentHTML('beforeend', `
+    <div id="sql-cell-${id}">
+      <pre style="background:#0f1117;border:1px solid #2d3148;border-radius:6px 6px 0 0;padding:8px 12px;font-family:monospace;font-size:12px;color:#818cf8;margin:0;white-space:pre-wrap">${escHtml(query)}</pre>
+      <div class="sql-cell-result" style="border:1px solid #2d3148;border-top:none;border-radius:0 0 6px 6px;padding:10px 12px;font-size:12px">Running…</div>
+    </div>`);
+  const resultEl = document.querySelector(`#sql-cell-${id} .sql-cell-result`);
+  cells.scrollTop = cells.scrollHeight;
+
+  const r = await post('run_sql', {
+    host: document.getElementById('sql-host').value,
+    port: document.getElementById('sql-port').value,
+    user: document.getElementById('sql-user').value,
+    pass: document.getElementById('sql-pass').value,
+    db:   document.getElementById('sql-db').value,
+    query,
+  });
+
+  if (!r.ok) {
+    resultEl.innerHTML = `<span style="color:#ef4444">✗ ${escHtml(r.error)}</span>`;
+  } else if (r.rows) {
+    if (!r.rows.length) {
+      resultEl.innerHTML = `<span style="color:#64748b">0 rows</span>`;
+    } else {
+      const cols = Object.keys(r.rows[0]);
+      resultEl.innerHTML = `<div style="overflow-x:auto"><table style="border-collapse:collapse;font-family:monospace;font-size:12px">
+        <tr>${cols.map(c => `<th style="text-align:left;padding:4px 10px;border-bottom:1px solid #2d3148;color:#94a3b8;white-space:nowrap">${escHtml(c)}</th>`).join('')}</tr>
+        ${r.rows.map(row => `<tr>${cols.map(c => `<td style="padding:4px 10px;border-bottom:1px solid #1e2235;color:#e2e8f0;white-space:nowrap">${row[c] === null ? '<span style="color:#64748b">NULL</span>' : escHtml(String(row[c]))}</td>`).join('')}</tr>`).join('')}
+      </table></div>
+      <div style="color:#64748b;margin-top:6px">${r.rows.length}${r.truncated ? '+' : ''} row(s)${r.truncated ? ' — truncated at 500' : ''}</div>`;
+    }
+  } else {
+    resultEl.innerHTML = `<span style="color:#22c55e">✓ ${r.affected} row(s) affected</span>`;
+  }
+  cells.scrollTop = cells.scrollHeight;
+  input.value = '';
+  input.focus();
+}
+
+function clearSqlCells() {
+  document.getElementById('sql-cells').innerHTML = '';
+}
+
 function siTogglePass() {
   const el   = document.getElementById('si-pass');
   const btn  = el?.nextElementSibling;
@@ -2985,11 +3133,11 @@ function escHtml(s) {
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 
 function showTab(tab) {
-  ['restore','frameworkinfo','serverinfo','backup'].forEach(t => {
+  ['restore','frameworkinfo','serverinfo','backup','sqlconsole'].forEach(t => {
     document.getElementById('pane-' + t).style.display = t === tab ? '' : 'none';
     document.getElementById('tab-' + t).classList.toggle('active', t === tab);
   });
-  const titles = {restore: 'Restore Wizard', frameworkinfo: 'Framework Info', serverinfo: 'Server Info', backup: 'Create Backup'};
+  const titles = {restore: 'Restore Wizard', frameworkinfo: 'Framework Info', serverinfo: 'Server Info', backup: 'Create Backup', sqlconsole: 'SQL Console'};
   document.getElementById('topbar-title').textContent = titles[tab] || tab;
 }
 
