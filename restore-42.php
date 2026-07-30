@@ -3125,8 +3125,13 @@ async function runAutoScan() {
                   <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};padding:10px 12px;font-size:14px;font-weight:700;color:${s.is_current ? '#4ade80' : '#e2e8f0'}">
                     ${escHtml(s.domain || '(no domain set)')}
                   </td>
+                  <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};padding:10px 12px;width:1%;white-space:nowrap;font-size:11px;font-weight:700;color:${s.active ? '#4ade80' : '#ef4444'}" title="b_lang.ACTIVE — is this site row enabled at all">
+                    ${s.active ? '● ENABLED' : '● DISABLED'}
+                  </td>
                   <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};padding:10px 12px;width:1%;white-space:nowrap">
-                    ${s.is_current ? `<span style="font-size:11px;font-weight:700;color:#052e22;background:#4ade80;border-radius:4px;padding:2px 8px">ACTIVE</span>` : ''}
+                    ${s.is_current ? `<span style="font-size:11px;font-weight:700;color:#052e22;background:#4ade80;border-radius:4px;padding:2px 8px">MATCHED</span>` : ''}
+                  </td>
+                  <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};padding:10px 12px;width:1%;white-space:nowrap">
                     ${isDefaultBadge ? `<span style="font-size:11px;font-weight:700;color:#ffffff;background:#f97316;border-radius:4px;padding:2px 8px">DEFAULT</span>` : ''}
                   </td>
                   <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};border-right:1px solid ${border};border-radius:0 8px 8px 0;padding:10px 12px;width:1%;white-space:nowrap;font-family:monospace;font-size:11px;color:${s.external_root ? '#facc15' : 'transparent'}">
