@@ -153,6 +153,9 @@ switch ($action) {
     case 'bitrix_toggle_devmode':
         handleBitrixToggleDevMode();
         break;
+    case 'bitrix_fix_domain':
+        handleBitrixFixDomain();
+        break;
     case 'run_sql':
         handleRunSql();
         break;
@@ -856,8 +859,9 @@ function handleScan(): void
     $dbCreds = extractDbCredentials($fwRoot, $fw);
     $siteUrl = extractSiteUrl($fwRoot, $fw);
     $prefix  = extractTablePrefix($fwRoot, $fw);
-    $bitrixSites  = $fw === 'bitrix' ? detectBitrixSites($dbCreds) : [];
+    $bitrixSites   = $fw === 'bitrix' ? detectBitrixSites($dbCreds) : [];
     $bitrixDevMode = $fw === 'bitrix' ? getBitrixDevMode($dbCreds) : null;
+    $bitrixDomain  = $fw === 'bitrix' ? detectBitrixDomainMismatch($dbCreds, $bitrixSites) : null;
 
     jsonOk([
         'root'              => $root,
@@ -875,6 +879,7 @@ function handleScan(): void
         'bitrix_available'  => detectBitrixPresent(),
         'bitrix_sites'      => $bitrixSites,
         'bitrix_dev_mode'   => $bitrixDevMode,
+        'bitrix_domain_check' => $bitrixDomain,
     ]);
 }
 
@@ -1218,6 +1223,90 @@ function getBitrixDevMode(array $dbCreds): ?string
         return $row === null ? null : (string)$row[0];
     } catch (Throwable $e) {
         return null;
+    }
+}
+
+/**
+ * Diagnose the classic Bitrix session-breaking bug: main.server_name (Main
+ * module settings) disagreeing with the domain actually bound to the active
+ * site in b_lang. Resolution order for "what the domain SHOULD be":
+ * b_lang's SERVER_NAME for an active site (the actual routing table) first,
+ * falling back to main.site_name if no site has one set — using both
+ * available signals rather than trusting either alone.
+ */
+function detectBitrixDomainMismatch(array $dbCreds, array $bitrixSites): ?array
+{
+    if (empty($dbCreds['db_host']) || empty($dbCreds['db_name'])) {
+        return null;
+    }
+    try {
+        $conn = dbConnect(
+            $dbCreds['db_host'],
+            $dbCreds['db_user'] ?? '',
+            $dbCreds['db_pass'] ?? '',
+            (int)($dbCreds['db_port'] ?? 3306),
+            $dbCreds['db_name']
+        );
+        $opts = ['server_name' => null, 'site_name' => null];
+        $res  = $conn->query("SELECT NAME, VALUE FROM b_option WHERE MODULE_ID = 'main' AND NAME IN ('server_name', 'site_name')");
+        while ($row = $res->fetch_assoc()) {
+            $opts[$row['NAME']] = $row['VALUE'];
+        }
+
+        $fromLang = null;
+        foreach ($bitrixSites as $s) {
+            if (!empty($s['domain'])) {
+                $fromLang = $s['domain'];
+                break;
+            }
+        }
+        $resolved = $fromLang ?: ($opts['site_name'] ?: null);
+
+        return [
+            'server_name'     => $opts['server_name'],
+            'site_name'       => $opts['site_name'],
+            'resolved_domain' => $resolved,
+            'mismatch'        => $resolved !== null && $opts['server_name'] !== $resolved,
+        ];
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+function handleBitrixFixDomain(): void
+{
+    $root = requireSiteDir($_POST['dir'] ?? '');
+    if (detectFramework($root) !== 'bitrix') {
+        jsonErr('Not a Bitrix installation');
+    }
+    $fwRoot  = findFrameworkRoot($root);
+    $dbCreds = extractDbCredentials($fwRoot, 'bitrix');
+    if (empty($dbCreds['db_host']) || empty($dbCreds['db_name'])) {
+        jsonErr('Could not resolve Bitrix DB credentials');
+    }
+    try {
+        $conn = dbConnect($dbCreds['db_host'], $dbCreds['db_user'] ?? '', $dbCreds['db_pass'] ?? '', (int)($dbCreds['db_port'] ?? 3306), $dbCreds['db_name']);
+
+        $bitrixSites = detectBitrixSites($dbCreds);
+        $mismatch    = detectBitrixDomainMismatch($dbCreds, $bitrixSites);
+        $target      = $mismatch['resolved_domain'] ?? null;
+        if (!$target) {
+            jsonErr('Could not determine the correct domain — no b_lang site has a SERVER_NAME and main.site_name is empty.');
+        }
+
+        foreach (['server_name', 'site_name'] as $name) {
+            $stmt = $conn->prepare("UPDATE b_option SET VALUE = ? WHERE MODULE_ID = 'main' AND NAME = ?");
+            $stmt->bind_param('ss', $target, $name);
+            $stmt->execute();
+            if ($conn->affected_rows === 0) {
+                $ins = $conn->prepare("INSERT INTO b_option (MODULE_ID, NAME, VALUE) VALUES ('main', ?, ?)");
+                $ins->bind_param('ss', $name, $target);
+                $ins->execute();
+            }
+        }
+        jsonOk(['domain' => $target]);
+    } catch (Throwable $e) {
+        jsonErr('DB error: ' . $e->getMessage());
     }
 }
 
@@ -2502,9 +2591,20 @@ select option{background:#1a1d27}
           <div>
             <div style="font-size:13px;font-weight:600;color:#e2e8f0;margin-bottom:6px">Developer mode (main.update_devsrv)</div>
             <p style="color:#facc15;font-size:12px;margin-bottom:12px">⚠ Per Bitrix's own documentation, switches to this mode are tracked by their license servers, and using it on a live production site is against license terms — it's meant for shared dev/staging installs. This is unrelated to the domain-license-mismatch warning, which is a separate account-portal mechanism.</p>
-            <div style="display:flex;align-items:center;gap:10px">
-              <span id="devmode-current" style="font-size:13px;color:#e2e8f0;font-family:monospace">—</span>
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+              <span id="devmode-badge" style="font-size:13px;font-weight:700;padding:5px 12px;border-radius:6px">—</span>
               <button class="btn btn-secondary btn-sm" onclick="toggleDevMode()">Flip</button>
+            </div>
+            <div id="devmode-domain-warning" style="display:none;font-size:12px;color:#facc15"></div>
+          </div>
+
+          <div id="bitrix-domain-check-section" style="display:none;margin-top:20px">
+            <div style="font-size:13px;font-weight:600;color:#e2e8f0;margin-bottom:6px">Domain configuration (session issues)</div>
+            <p style="color:#94a3b8;font-size:12px;margin-bottom:12px">If <code>main.server_name</code> doesn't match the domain actually bound to the active site in the site list, Bitrix sessions can break. Resolved domain below prefers the site list's bound domain, falling back to <code>main.site_name</code> if none is set.</p>
+            <div id="bitrix-domain-table" style="font-size:12px;font-family:monospace;margin-bottom:10px"></div>
+            <div id="bitrix-domain-fix-wrap" style="display:none">
+              <button class="btn btn-primary btn-sm" onclick="fixBitrixDomain()">Sync server_name to resolved domain</button>
+              <span id="bitrix-domain-fix-result" style="font-size:13px;color:#94a3b8;margin-left:8px"></span>
             </div>
           </div>
         </div>
@@ -2576,6 +2676,8 @@ select option{background:#1a1d27}
             <div class="form-group"><label>DB Name</label><input id="sql-db"></div>
           </div>
 
+          <div id="sql-tabs-bar" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid #2d3148"></div>
+
           <div id="sql-cells" style="display:flex;flex-direction:column;gap:12px;margin-bottom:12px;max-height:520px;overflow-y:auto"></div>
 
           <textarea id="sql-input" rows="4" placeholder="SELECT * FROM b_option WHERE MODULE_ID='main' LIMIT 20;&#10;&#10;One statement per cell — Ctrl+Enter (⌘+Enter) to run."
@@ -2583,7 +2685,7 @@ select option{background:#1a1d27}
                     onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter'){event.preventDefault();runSqlCell();}"></textarea>
           <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
             <button class="btn btn-primary" onclick="runSqlCell()">▶ Run <span style="opacity:.6;font-size:11px">(Ctrl+Enter)</span></button>
-            <button class="btn btn-secondary btn-sm" onclick="clearSqlCells()">Clear</button>
+            <button class="btn btn-secondary btn-sm" onclick="clearActiveSqlTab()">Clear tab</button>
           </div>
         </div>
       </div>
@@ -2801,6 +2903,7 @@ async function showApp() {
   document.getElementById('main-app').style.display = '';
   renderStepsNav();
   showTab('frameworkinfo');
+  loadSqlTabs();
   await loadFileList();
   runAutoScan(); // fire-and-forget; populates Framework/Server Info panes
 }
@@ -2862,8 +2965,8 @@ async function runAutoScan() {
   // Show/hide the Bitrix-specific tools panel
   const bitrixPanel = document.getElementById('bitrix-tools-panel');
   if (bitrixPanel) bitrixPanel.style.display = (fw === 'bitrix') ? '' : 'none';
-  const devModeEl = document.getElementById('devmode-current');
-  if (devModeEl) devModeEl.textContent = scan.bitrix_dev_mode ?? '(not set)';
+  renderDevModeStatus(scan);
+  renderBitrixDomainCheck(scan);
 
   const credRows = hasCreds ? [
     ['Host',     creds.db_host || '—'],
@@ -3057,18 +3160,257 @@ async function countDirSize() {
   out.textContent = r.ok ? fmtSize(r.size) : '✗ ' + r.error;
 }
 
+function renderDevModeStatus(scan) {
+  const badge = document.getElementById('devmode-badge');
+  const warn  = document.getElementById('devmode-domain-warning');
+  if (!badge) return;
+
+  const value = scan.bitrix_dev_mode; // 'Y' | 'N' | null
+  if (value === null || value === undefined) {
+    badge.textContent = 'Site mode: UNKNOWN';
+    badge.style.background = '#64748b22';
+    badge.style.color = '#64748b';
+  } else if (value === 'Y') {
+    badge.textContent = 'Site mode: DEV';
+    badge.style.background = '#22c55e22';
+    badge.style.color = '#22c55e';
+  } else {
+    badge.textContent = 'Site mode: PROD';
+    badge.style.background = '#ef444422';
+    badge.style.color = '#ef4444';
+  }
+
+  // Heuristic: a 3+ part domain (e.g. dev.example.com, test.example.com)
+  // often signals a staging/dev subdomain rather than the real production
+  // domain — flag it when the site is claiming to be PROD.
+  if (warn) {
+    warn.style.display = 'none';
+    const current = (scan.bitrix_sites || []).find(s => s.is_current);
+    const domain  = current?.domain || '';
+    if (value === 'N' && domain && domain.split('.').length >= 3) {
+      warn.textContent = `⚠ Domain "${domain}" has 3+ parts (looks like a dev/staging subdomain) but this site reports PROD mode — double check that's intentional.`;
+      warn.style.display = '';
+    }
+  }
+}
+
 async function toggleDevMode() {
   if (!fwData.root) return;
   if (!confirm('Toggle Bitrix developer mode (main.update_devsrv)?\n\nBitrix’s own documentation states this is tracked by their license servers and using it on a live production site is against license terms — only do this on a genuine dev/staging copy.\n\nContinue?')) return;
-  const el = document.getElementById('devmode-current');
-  el.textContent = 'Toggling…';
+  const badge = document.getElementById('devmode-badge');
+  badge.textContent = 'Toggling…';
   const r = await post('bitrix_toggle_devmode', {dir: fwData.root});
-  el.textContent = r.ok ? r.new : '✗ ' + r.error;
+  if (!r.ok) {
+    badge.textContent = '✗ ' + r.error;
+    return;
+  }
+  fwData.bitrix_dev_mode = r.new;
+  renderDevModeStatus(fwData);
 }
 
-// ── SQL Console ───────────────────────────────────────────────────────────────
+function renderBitrixDomainCheck(scan) {
+  const section = document.getElementById('bitrix-domain-check-section');
+  const table   = document.getElementById('bitrix-domain-table');
+  const fixWrap = document.getElementById('bitrix-domain-fix-wrap');
+  if (!section) return;
 
-let sqlCellCount = 0;
+  const check = scan.bitrix_domain_check;
+  if (!check) { section.style.display = 'none'; return; }
+  section.style.display = '';
+
+  const row = (label, value, color) => `<div style="margin-bottom:4px"><span style="color:#64748b">${label}:</span> <span style="color:${color || '#e2e8f0'}">${escHtml(value || '(not set)')}</span></div>`;
+  table.innerHTML =
+    row('main.server_name', check.server_name, check.mismatch ? '#ef4444' : '#e2e8f0') +
+    row('main.site_name', check.site_name) +
+    row('resolved (site list, fallback site_name)', check.resolved_domain, '#22c55e') +
+    (check.mismatch
+      ? `<div style="color:#ef4444;margin-top:6px">⚠ Mismatch — main.server_name does not match the resolved domain. This is a common cause of broken sessions.</div>`
+      : `<div style="color:#22c55e;margin-top:6px">✓ server_name matches the resolved domain.</div>`);
+
+  fixWrap.style.display = check.mismatch ? '' : 'none';
+}
+
+async function fixBitrixDomain() {
+  if (!fwData.root) return;
+  const check = fwData.bitrix_domain_check;
+  if (!confirm(`Set main.server_name AND main.site_name to "${check?.resolved_domain}"?\n\nThis directly modifies the b_option table. Continue?`)) return;
+  const result = document.getElementById('bitrix-domain-fix-result');
+  result.textContent = 'Applying…';
+  const r = await post('bitrix_fix_domain', {dir: fwData.root});
+  if (!r.ok) {
+    result.textContent = '✗ ' + r.error;
+    return;
+  }
+  result.textContent = '✓ Set to ' + r.domain;
+  runAutoScan();
+}
+
+// ── SQL Console — tabbed, persisted to localStorage ────────────────────────────
+
+const SQL_TABS_KEY = 'r42_sql_tabs';
+let sqlTabs = [];
+let activeSqlTabId = null;
+
+function newSqlTab(name) {
+  return { id: 'tab_' + Math.random().toString(36).slice(2, 10), name: name || 'Tab', cells: [] };
+}
+
+function loadSqlTabs() {
+  try {
+    const raw = localStorage.getItem(SQL_TABS_KEY);
+    if (raw) {
+      const data = JSON.parse(raw);
+      if (Array.isArray(data.tabs) && data.tabs.length) {
+        sqlTabs = data.tabs;
+        activeSqlTabId = data.activeTabId && sqlTabs.some(t => t.id === data.activeTabId)
+          ? data.activeTabId : sqlTabs[0].id;
+        renderSqlTabsBar();
+        renderActiveSqlTabCells();
+        return;
+      }
+    }
+  } catch (e) { console.warn('Failed to load SQL tabs:', e); }
+  // First run / corrupted storage — start with one empty tab
+  const t = newSqlTab('Tab 1');
+  sqlTabs = [t];
+  activeSqlTabId = t.id;
+  saveSqlTabs();
+  renderSqlTabsBar();
+  renderActiveSqlTabCells();
+}
+
+function saveSqlTabs() {
+  try {
+    localStorage.setItem(SQL_TABS_KEY, JSON.stringify({ tabs: sqlTabs, activeTabId: activeSqlTabId }));
+  } catch (e) { console.warn('Failed to save SQL tabs:', e); }
+}
+
+function activeSqlTab() {
+  return sqlTabs.find(t => t.id === activeSqlTabId) || sqlTabs[0];
+}
+
+function renderSqlTabsBar() {
+  const bar = document.getElementById('sql-tabs-bar');
+  if (!bar) return;
+  bar.innerHTML = sqlTabs.map(t => `
+    <span style="display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:6px;cursor:pointer;font-size:12px;
+                  background:${t.id === activeSqlTabId ? '#1e2235' : 'transparent'};
+                  color:${t.id === activeSqlTabId ? '#818cf8' : '#94a3b8'};
+                  border:1px solid ${t.id === activeSqlTabId ? '#818cf8' : '#2d3148'}"
+          onclick="switchSqlTab('${t.id}')">
+      ${escHtml(t.name)}
+      <button onclick="event.stopPropagation();deleteSqlTab('${t.id}')" title="Delete tab"
+              style="background:none;border:none;cursor:pointer;color:inherit;opacity:.6;font-size:11px;padding:0;line-height:1">✕</button>
+    </span>`).join('')
+    + `<button class="btn btn-secondary btn-sm" onclick="addSqlTab()" style="padding:5px 10px">+ New Tab</button>`;
+}
+
+function switchSqlTab(id) {
+  activeSqlTabId = id;
+  saveSqlTabs();
+  renderSqlTabsBar();
+  renderActiveSqlTabCells();
+}
+
+function addSqlTab() {
+  const t = newSqlTab('Tab ' + (sqlTabs.length + 1));
+  sqlTabs.push(t);
+  switchSqlTab(t.id);
+}
+
+function deleteSqlTab(id) {
+  const t = sqlTabs.find(x => x.id === id);
+  if (t && t.cells.length && !confirm(`Delete "${t.name}" and its ${t.cells.length} cell(s)?`)) return;
+  sqlTabs = sqlTabs.filter(x => x.id !== id);
+  if (!sqlTabs.length) sqlTabs = [newSqlTab('Tab 1')];
+  if (activeSqlTabId === id) activeSqlTabId = sqlTabs[0].id;
+  saveSqlTabs();
+  renderSqlTabsBar();
+  renderActiveSqlTabCells();
+}
+
+function clearActiveSqlTab() {
+  const t = activeSqlTab();
+  if (t.cells.length && !confirm(`Clear all ${t.cells.length} cell(s) in "${t.name}"?`)) return;
+  t.cells = [];
+  saveSqlTabs();
+  renderActiveSqlTabCells();
+}
+
+function buildSqlResultHtml(r) {
+  if (!r.ok) {
+    return `<span style="color:#ef4444">✗ ${escHtml(r.error)}</span>`;
+  }
+  if (r.rows) {
+    if (!r.rows.length) return `<span style="color:#64748b">0 rows</span>`;
+    const cols = Object.keys(r.rows[0]);
+    return `<div style="overflow-x:auto"><table style="border-collapse:collapse;font-family:monospace;font-size:12px">
+      <tr>${cols.map(c => `<th style="text-align:left;padding:4px 10px;border-bottom:1px solid #2d3148;color:#94a3b8;white-space:nowrap">${escHtml(c)}</th>`).join('')}</tr>
+      ${r.rows.map(row => `<tr>${cols.map(c => `<td style="padding:4px 10px;border-bottom:1px solid #1e2235;color:#e2e8f0;white-space:nowrap">${row[c] === null ? '<span style="color:#64748b">NULL</span>' : escHtml(String(row[c]))}</td>`).join('')}</tr>`).join('')}
+    </table></div>
+    <div style="color:#64748b;margin-top:6px">${r.rows.length}${r.truncated ? '+' : ''} row(s)${r.truncated ? ' — truncated at 500' : ''}</div>`;
+  }
+  return `<span style="color:#22c55e">✓ ${r.affected} row(s) affected</span>`;
+}
+
+function sqlResultAsMarkdown(query, r) {
+  let md = '```sql\n' + query + '\n```\n\n';
+  if (!r.ok) {
+    md += `> Error: ${r.error}\n`;
+  } else if (r.rows) {
+    if (!r.rows.length) {
+      md += '_0 rows_\n';
+    } else {
+      const cols = Object.keys(r.rows[0]);
+      const esc = v => String(v).replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+      md += `| ${cols.join(' | ')} |\n`;
+      md += `|${cols.map(() => '---').join('|')}|\n`;
+      for (const row of r.rows) {
+        md += `| ${cols.map(c => row[c] === null ? 'NULL' : esc(row[c])).join(' | ')} |\n`;
+      }
+      if (r.truncated) md += `\n_truncated at 500 rows_\n`;
+    }
+  } else {
+    md += `_${r.affected} row(s) affected_\n`;
+  }
+  return md;
+}
+
+async function copySqlCellMarkdown(btn) {
+  const idx = Number(btn.dataset.cellIndex);
+  const cell = activeSqlTab().cells[idx];
+  if (!cell) return;
+  try {
+    await navigator.clipboard.writeText(sqlResultAsMarkdown(cell.query, cell.response));
+    const orig = btn.textContent;
+    btn.textContent = '✓ Copied';
+    setTimeout(() => { btn.textContent = orig; }, 1500);
+  } catch (e) {
+    alert('Copy failed: ' + e.message);
+  }
+}
+
+function renderActiveSqlTabCells() {
+  const cellsEl = document.getElementById('sql-cells');
+  const tab = activeSqlTab();
+  cellsEl.innerHTML = tab.cells.map((c, i) => sqlCellHtml(c.query, c.response, i)).join('');
+  cellsEl.scrollTop = cellsEl.scrollHeight;
+}
+
+// query/response are never embedded inline in the HTML (SQL text routinely
+// contains quotes) — the copy button looks itself up via data-cell-index
+// against the in-memory tab data instead.
+function sqlCellHtml(query, response, index) {
+  return `
+    <div>
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;background:#0f1117;border:1px solid #2d3148;border-radius:6px 6px 0 0;padding:8px 12px">
+        <pre style="font-family:monospace;font-size:12px;color:#818cf8;margin:0;white-space:pre-wrap;flex:1">${escHtml(query)}</pre>
+        <button data-cell-index="${index}" onclick="copySqlCellMarkdown(this)"
+                style="background:none;border:none;cursor:pointer;color:#64748b;font-size:11px;white-space:nowrap;padding:2px 4px" title="Copy query + result as Markdown">📋 Copy MD</button>
+      </div>
+      <div style="border:1px solid #2d3148;border-top:none;border-radius:0 0 6px 6px;padding:10px 12px;font-size:12px">${buildSqlResultHtml(response)}</div>
+    </div>`;
+}
 
 function useDetectedSqlCreds() {
   const creds = fwData.db_credentials || {};
@@ -3087,16 +3429,15 @@ async function runSqlCell() {
   const input = document.getElementById('sql-input');
   const query = input.value.trim();
   if (!query) return;
+  if (!sqlTabs.length) loadSqlTabs();
 
-  const cells = document.getElementById('sql-cells');
-  const id = ++sqlCellCount;
-  cells.insertAdjacentHTML('beforeend', `
-    <div id="sql-cell-${id}">
+  const cellsEl = document.getElementById('sql-cells');
+  cellsEl.insertAdjacentHTML('beforeend', `
+    <div id="sql-cell-pending">
       <pre style="background:#0f1117;border:1px solid #2d3148;border-radius:6px 6px 0 0;padding:8px 12px;font-family:monospace;font-size:12px;color:#818cf8;margin:0;white-space:pre-wrap">${escHtml(query)}</pre>
-      <div class="sql-cell-result" style="border:1px solid #2d3148;border-top:none;border-radius:0 0 6px 6px;padding:10px 12px;font-size:12px">Running…</div>
+      <div style="border:1px solid #2d3148;border-top:none;border-radius:0 0 6px 6px;padding:10px 12px;font-size:12px">Running…</div>
     </div>`);
-  const resultEl = document.querySelector(`#sql-cell-${id} .sql-cell-result`);
-  cells.scrollTop = cells.scrollHeight;
+  cellsEl.scrollTop = cellsEl.scrollHeight;
 
   const r = await post('run_sql', {
     host: document.getElementById('sql-host').value,
@@ -3107,29 +3448,13 @@ async function runSqlCell() {
     query,
   });
 
-  if (!r.ok) {
-    resultEl.innerHTML = `<span style="color:#ef4444">✗ ${escHtml(r.error)}</span>`;
-  } else if (r.rows) {
-    if (!r.rows.length) {
-      resultEl.innerHTML = `<span style="color:#64748b">0 rows</span>`;
-    } else {
-      const cols = Object.keys(r.rows[0]);
-      resultEl.innerHTML = `<div style="overflow-x:auto"><table style="border-collapse:collapse;font-family:monospace;font-size:12px">
-        <tr>${cols.map(c => `<th style="text-align:left;padding:4px 10px;border-bottom:1px solid #2d3148;color:#94a3b8;white-space:nowrap">${escHtml(c)}</th>`).join('')}</tr>
-        ${r.rows.map(row => `<tr>${cols.map(c => `<td style="padding:4px 10px;border-bottom:1px solid #1e2235;color:#e2e8f0;white-space:nowrap">${row[c] === null ? '<span style="color:#64748b">NULL</span>' : escHtml(String(row[c]))}</td>`).join('')}</tr>`).join('')}
-      </table></div>
-      <div style="color:#64748b;margin-top:6px">${r.rows.length}${r.truncated ? '+' : ''} row(s)${r.truncated ? ' — truncated at 500' : ''}</div>`;
-    }
-  } else {
-    resultEl.innerHTML = `<span style="color:#22c55e">✓ ${r.affected} row(s) affected</span>`;
-  }
-  cells.scrollTop = cells.scrollHeight;
+  activeSqlTab().cells.push({ query, response: r });
+  saveSqlTabs();
+  document.getElementById('sql-cell-pending')?.remove();
+  cellsEl.insertAdjacentHTML('beforeend', sqlCellHtml(query, r, activeSqlTab().cells.length - 1));
+  cellsEl.scrollTop = cellsEl.scrollHeight;
   input.value = '';
   input.focus();
-}
-
-function clearSqlCells() {
-  document.getElementById('sql-cells').innerHTML = '';
 }
 
 function siTogglePass() {
