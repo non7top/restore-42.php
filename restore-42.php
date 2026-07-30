@@ -1211,11 +1211,12 @@ function detectBitrixSites(array $dbCreds): array
             (int)($dbCreds['db_port'] ?? 3306),
             $dbCreds['db_name']
         );
-        // SORT determines Bitrix's own fallback order (CSite::GetCurByDomain
-        // falls back to the first enabled site by SORT when no SERVER_NAME
-        // matches the request — Bitrix always resolves to SOME site, it can't
-        // boot with none, so "no match" must never mean "nothing is current").
-        $rows = $conn->query("SELECT LID, SERVER_NAME, DOC_ROOT, ACTIVE, SORT FROM b_lang ORDER BY SORT ASC, LID ASC")->fetch_all(MYSQLI_ASSOC);
+        // b_lang has a real DEF column ('Y'/'N') — Bitrix's own explicit
+        // "this is the default site" flag, maintained by its admin UI
+        // (Настройки → Сайты → Список сайтов → По умолчанию). No need to
+        // infer a fallback via SORT order; just read what Bitrix itself
+        // already recorded.
+        $rows = $conn->query("SELECT LID, SERVER_NAME, DOC_ROOT, ACTIVE, DEF FROM b_lang ORDER BY DEF DESC, LID ASC")->fetch_all(MYSQLI_ASSOC);
         $currentHost = currentRequestHost();
 
         $sites = array_map(function ($r) use ($currentHost) {
@@ -1226,13 +1227,17 @@ function detectBitrixSites(array $dbCreds): array
                 'domain'           => $r['SERVER_NAME'],
                 'doc_root'         => $docRoot,
                 'active'           => $active,
+                'is_default_flag'  => $r['DEF'] === 'Y',
                 'domain_matches'   => $active && $r['SERVER_NAME'] !== '' && normalizeHost($r['SERVER_NAME']) === $currentHost,
                 'external_root'    => $docRoot !== '' && rtrim($docRoot, '/') !== rtrim(__DIR__, '/'),
             ];
         }, $rows ?: []);
 
-        // Prefer a genuine domain match; otherwise fall back to the first
-        // enabled site in SORT order — the same resolution Bitrix itself uses.
+        // Prefer a genuine domain match; otherwise fall back to whichever
+        // site has DEF='Y' — Bitrix's own recorded default, not a guess. If
+        // somehow no site has DEF='Y' either (shouldn't normally happen),
+        // fall back further to the first site overall so DEFAULT always
+        // points at *some* row rather than showing no badge at all.
         $matchIdx = null;
         foreach ($sites as $i => $s) {
             if ($s['domain_matches']) { $matchIdx = $i; break; }
@@ -1240,14 +1245,17 @@ function detectBitrixSites(array $dbCreds): array
         $matchedByDomain = $matchIdx !== null;
         if ($matchIdx === null) {
             foreach ($sites as $i => $s) {
-                if ($s['active']) { $matchIdx = $i; break; }
+                if ($s['is_default_flag']) { $matchIdx = $i; break; }
             }
+        }
+        if ($matchIdx === null && !empty($sites)) {
+            $matchIdx = 0;
         }
 
         foreach ($sites as $i => &$s) {
             $s['is_current']    = $i === $matchIdx;
             $s['matched_by']    = $i === $matchIdx ? ($matchedByDomain ? 'domain' : 'fallback') : null;
-            unset($s['domain_matches']);
+            unset($s['domain_matches'], $s['is_default_flag']);
         }
         unset($s);
         return $sites;
@@ -3213,7 +3221,7 @@ async function runAutoScan() {
             ${scan.bitrix_kernel_verified ? `
               <div style="background:#052e2255;border:1px solid #4ade80;border-radius:6px;padding:8px 12px;color:#bbf7d0;font-size:13px;margin-bottom:10px">✓ ACTIVE below is confirmed directly from Bitrix's own kernel (SITE_ID) — not a guess.</div>
             ` : `
-              <div style="background:#78350f55;border:1px solid #facc15;border-radius:6px;padding:8px 12px;color:#fde68a;font-size:13px;margin-bottom:10px">⚠ Could not verify the active site via Bitrix's kernel (bootstrap failed, or bitrix/header.php wasn't found here). ACTIVE/DEFAULT below are a best-effort guess only — a real domain match, or the first enabled site as fallback if none matched.</div>
+              <div style="background:#78350f55;border:1px solid #facc15;border-radius:6px;padding:8px 12px;color:#fde68a;font-size:13px;margin-bottom:10px">⚠ Could not verify the active site via Bitrix's kernel (bootstrap failed, or bitrix/header.php wasn't found here). ACTIVE below reflects a real domain match if one exists; DEFAULT reads b_lang's own DEF flag (Bitrix's recorded default site) as the fallback when no domain matched.</div>
             `}
             <div id="bitrix-verify-result" style="font-size:12px;margin-bottom:10px"></div>
             ${externalSites.length ? `<div style="background:#78350f55;border:1px solid #facc15;border-radius:6px;padding:8px 12px;color:#fde68a;font-size:13px;margin-bottom:10px">⚠ ${externalSites.length} site(s) have a separate document root — back those up independently.</div>` : ''}
