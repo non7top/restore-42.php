@@ -7,7 +7,7 @@
  */
 
 define('RESTORE_VERSION', '1.0.0');
-define('STORED_PASS_HASH', ''); // self-updated on first login — do not edit this line
+define('STORED_PASS_HASH', '$2y$10$Nop6joBTPF1twYUmMq0Z7OOQU2KBcy5K4Mw6u9R/NPr31Wub5hHnO'); // self-updated on first login — do not edit this line
 define('WORK_DIR', __DIR__ . '/.restore');
 define('UPLOADS_DIR', WORK_DIR . '/uploads');
 define('EXTRACT_DIR', WORK_DIR . '/extract');
@@ -22,34 +22,49 @@ ini_set('memory_limit', '512M');
 
 // No PHP session — auth uses a stateless HMAC-signed cookie instead.
 
-foreach ([WORK_DIR, UPLOADS_DIR, EXTRACT_DIR, BACKUPS_DIR] as $d) {
-    if (!is_dir($d)) {
-        mkdir($d, 0755, true);
+/**
+ * Create WORK_DIR and its subdirectories, access guards, and clean up
+ * abandoned upload chunks. Called lazily — only when an authenticated action
+ * actually needs the work dir — so simply loading the login screen or
+ * hitting check_auth never litters the site with an empty .restore/.
+ */
+function ensureWorkDirs(): void
+{
+    static $done = false;
+    if ($done) {
+        return;
     }
-}
-// Protect work dir from direct web access.
-// .htaccess only works under Apache — nginx ignores it entirely and will
-// happily serve or list files in WORK_DIR unless its own config blocks it.
-// index.php guards below are a defense-in-depth fallback: they stop directory
-// listing under both servers (as long as nginx routes .php to PHP-FPM, which
-// is the near-universal default), but do NOT stop a direct request for a
-// specific known filename under nginx — only a server-config rule can do that.
-$htFile = WORK_DIR . '/.htaccess';
-if (!file_exists($htFile)) {
-    file_put_contents($htFile, "Require all denied\nDeny from all\n");
-}
-$denyPhp = "<?php http_response_code(403); exit('Forbidden');\n";
-foreach ([WORK_DIR, UPLOADS_DIR, EXTRACT_DIR, BACKUPS_DIR] as $d) {
-    $guard = $d . '/index.php';
-    if (!file_exists($guard)) {
-        file_put_contents($guard, $denyPhp);
+    $done = true;
+
+    foreach ([WORK_DIR, UPLOADS_DIR, EXTRACT_DIR, BACKUPS_DIR] as $d) {
+        if (!is_dir($d)) {
+            mkdir($d, 0755, true);
+        }
     }
-}
-// Clean up chunk files abandoned for more than 1 hour (truly orphaned).
-// Do NOT delete recent chunks — they belong to an upload that is in progress.
-foreach (glob(UPLOADS_DIR . '/*.chunk*') ?: [] as $orphan) {
-    if (time() - filemtime($orphan) > 3600) {
-        unlink($orphan);
+    // Protect work dir from direct web access.
+    // .htaccess only works under Apache — nginx ignores it entirely and will
+    // happily serve or list files in WORK_DIR unless its own config blocks it.
+    // index.php guards below are a defense-in-depth fallback: they stop directory
+    // listing under both servers (as long as nginx routes .php to PHP-FPM, which
+    // is the near-universal default), but do NOT stop a direct request for a
+    // specific known filename under nginx — only a server-config rule can do that.
+    $htFile = WORK_DIR . '/.htaccess';
+    if (!file_exists($htFile)) {
+        file_put_contents($htFile, "Require all denied\nDeny from all\n");
+    }
+    $denyPhp = "<?php http_response_code(403); exit('Forbidden');\n";
+    foreach ([WORK_DIR, UPLOADS_DIR, EXTRACT_DIR, BACKUPS_DIR] as $d) {
+        $guard = $d . '/index.php';
+        if (!file_exists($guard)) {
+            file_put_contents($guard, $denyPhp);
+        }
+    }
+    // Clean up chunk files abandoned for more than 1 hour (truly orphaned).
+    // Do NOT delete recent chunks — they belong to an upload that is in progress.
+    foreach (glob(UPLOADS_DIR . '/*.chunk*') ?: [] as $orphan) {
+        if (time() - filemtime($orphan) > 3600) {
+            unlink($orphan);
+        }
     }
 }
 
@@ -59,6 +74,7 @@ $action = $_REQUEST['action'] ?? '';
 
 if ($action && !in_array($action, ['login', 'check_auth'], true)) {
     requireAuth();
+    ensureWorkDirs();
 }
 
 switch ($action) {
@@ -127,6 +143,9 @@ switch ($action) {
         break;
     case 'bitrix_login':
         handleBitrixAdminAuth();
+        break;
+    case 'bitrix_toggle_devmode':
+        handleBitrixToggleDevMode();
         break;
     case 'download_backup':
         handleDownloadBackup();
@@ -828,7 +847,8 @@ function handleScan(): void
     $dbCreds = extractDbCredentials($fwRoot, $fw);
     $siteUrl = extractSiteUrl($fwRoot, $fw);
     $prefix  = extractTablePrefix($fwRoot, $fw);
-    $bitrixSites = $fw === 'bitrix' ? detectBitrixSites($dbCreds) : [];
+    $bitrixSites  = $fw === 'bitrix' ? detectBitrixSites($dbCreds) : [];
+    $bitrixDevMode = $fw === 'bitrix' ? getBitrixDevMode($dbCreds) : null;
 
     jsonOk([
         'root'              => $root,
@@ -845,6 +865,7 @@ function handleScan(): void
         'backups'           => listBackups(),
         'bitrix_available'  => detectBitrixPresent(),
         'bitrix_sites'      => $bitrixSites,
+        'bitrix_dev_mode'   => $bitrixDevMode,
     ]);
 }
 
@@ -1159,6 +1180,63 @@ function detectBitrixSites(array $dbCreds): array
         ], $rows ?: []);
     } catch (Throwable $e) {
         return [];
+    }
+}
+
+/**
+ * Read Bitrix's "Installation for development" flag (Main module, admin UI
+ * field name opt_update_devsrv → b_option MODULE_ID='main',
+ * NAME='update_devsrv'). Per Bitrix's own documentation this is tracked by
+ * their license servers and is meant for shared dev/staging installs — not
+ * for silencing the separate domain-license-mismatch warning, which is an
+ * account-portal mechanism, not a local DB flag. Returns null if unreadable
+ * or unset.
+ */
+function getBitrixDevMode(array $dbCreds): ?string
+{
+    if (empty($dbCreds['db_host']) || empty($dbCreds['db_name'])) {
+        return null;
+    }
+    try {
+        $pdo = dbConnect(
+            $dbCreds['db_host'],
+            $dbCreds['db_user'] ?? '',
+            $dbCreds['db_pass'] ?? '',
+            (int)($dbCreds['db_port'] ?? 3306),
+            $dbCreds['db_name']
+        );
+        $stmt = $pdo->query("SELECT VALUE FROM b_option WHERE MODULE_ID = 'main' AND NAME = 'update_devsrv' LIMIT 1");
+        $val  = $stmt->fetchColumn();
+        return $val === false ? null : (string)$val;
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+function handleBitrixToggleDevMode(): void
+{
+    $root = requireSiteDir($_POST['dir'] ?? '');
+    if (detectFramework($root) !== 'bitrix') {
+        jsonErr('Not a Bitrix installation');
+    }
+    $fwRoot  = findFrameworkRoot($root);
+    $dbCreds = extractDbCredentials($fwRoot, 'bitrix');
+    if (empty($dbCreds['db_host']) || empty($dbCreds['db_name'])) {
+        jsonErr('Could not resolve Bitrix DB credentials');
+    }
+    try {
+        $pdo  = dbConnect($dbCreds['db_host'], $dbCreds['db_user'] ?? '', $dbCreds['db_pass'] ?? '', (int)($dbCreds['db_port'] ?? 3306), $dbCreds['db_name']);
+        $stmt = $pdo->query("SELECT VALUE FROM b_option WHERE MODULE_ID = 'main' AND NAME = 'update_devsrv' LIMIT 1");
+        $old  = $stmt->fetchColumn();
+        $new  = ($old === 'Y') ? 'N' : 'Y';
+        if ($old === false) {
+            $pdo->prepare("INSERT INTO b_option (MODULE_ID, NAME, VALUE) VALUES ('main', 'update_devsrv', ?)")->execute([$new]);
+        } else {
+            $pdo->prepare("UPDATE b_option SET VALUE = ? WHERE MODULE_ID = 'main' AND NAME = 'update_devsrv'")->execute([$new]);
+        }
+        jsonOk(['old' => $old === false ? null : $old, 'new' => $new]);
+    } catch (Throwable $e) {
+        jsonErr('DB error: ' . $e->getMessage());
     }
 }
 
@@ -2342,10 +2420,19 @@ select option{background:#1a1d27}
             </div>
           </div>
 
-          <div>
+          <div style="margin-bottom:20px">
             <div style="font-size:13px;font-weight:600;color:#e2e8f0;margin-bottom:6px">Emergency admin login</div>
             <p style="color:#94a3b8;font-size:13px;margin-bottom:12px">Opens a Bitrix session as superadmin (user ID&nbsp;1) and redirects into the admin panel — no file is written to disk.</p>
             <a class="btn btn-primary" href="<?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?>?action=bitrix_login" target="_blank" rel="noopener">Login as Admin</a>
+          </div>
+
+          <div>
+            <div style="font-size:13px;font-weight:600;color:#e2e8f0;margin-bottom:6px">Developer mode (main.update_devsrv)</div>
+            <p style="color:#facc15;font-size:12px;margin-bottom:12px">⚠ Per Bitrix's own documentation, switches to this mode are tracked by their license servers, and using it on a live production site is against license terms — it's meant for shared dev/staging installs. This is unrelated to the domain-license-mismatch warning, which is a separate account-portal mechanism.</p>
+            <div style="display:flex;align-items:center;gap:10px">
+              <span id="devmode-current" style="font-size:13px;color:#e2e8f0;font-family:monospace">—</span>
+              <button class="btn btn-secondary btn-sm" onclick="toggleDevMode()">Flip</button>
+            </div>
           </div>
         </div>
       </div><!-- /pane-frameworkinfo -->
@@ -2671,6 +2758,8 @@ async function runAutoScan() {
   // Show/hide the Bitrix-specific tools panel
   const bitrixPanel = document.getElementById('bitrix-tools-panel');
   if (bitrixPanel) bitrixPanel.style.display = (fw === 'bitrix') ? '' : 'none';
+  const devModeEl = document.getElementById('devmode-current');
+  if (devModeEl) devModeEl.textContent = scan.bitrix_dev_mode ?? '(not set)';
 
   const credRows = hasCreds ? [
     ['Host',     creds.db_host || '—'],
@@ -2862,6 +2951,15 @@ async function countDirSize() {
   const r = await post('dir_size', {dir: fwData.root});
   btn.disabled = false;
   out.textContent = r.ok ? fmtSize(r.size) : '✗ ' + r.error;
+}
+
+async function toggleDevMode() {
+  if (!fwData.root) return;
+  if (!confirm('Toggle Bitrix developer mode (main.update_devsrv)?\n\nBitrix’s own documentation states this is tracked by their license servers and using it on a live production site is against license terms — only do this on a genuine dev/staging copy.\n\nContinue?')) return;
+  const el = document.getElementById('devmode-current');
+  el.textContent = 'Toggling…';
+  const r = await post('bitrix_toggle_devmode', {dir: fwData.root});
+  el.textContent = r.ok ? r.new : '✗ ' + r.error;
 }
 
 function siTogglePass() {
