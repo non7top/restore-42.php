@@ -150,6 +150,9 @@ switch ($action) {
     case 'bitrix_login':
         handleBitrixAdminAuth();
         break;
+    case 'bitrix_verify_site':
+        handleBitrixVerifySite();
+        break;
     case 'bitrix_toggle_devmode':
         handleBitrixToggleDevMode();
         break;
@@ -1203,29 +1206,46 @@ function detectBitrixSites(array $dbCreds): array
             (int)($dbCreds['db_port'] ?? 3306),
             $dbCreds['db_name']
         );
-        $rows = $conn->query("SELECT LID, SERVER_NAME, DOC_ROOT, ACTIVE FROM b_lang")->fetch_all(MYSQLI_ASSOC);
-        // "Current" means this site's SERVER_NAME matches the domain this page
-        // was actually loaded from AND the site is active — the same match
-        // Bitrix itself performs (CSite::GetCurByDomain skips inactive sites).
-        // DOC_ROOT is usually empty for every site in a single-docroot install,
-        // so it's useless for telling sites apart; it's only meaningful for
-        // flagging a genuinely SEPARATE document root below.
+        // SORT determines Bitrix's own fallback order (CSite::GetCurByDomain
+        // falls back to the first enabled site by SORT when no SERVER_NAME
+        // matches the request — Bitrix always resolves to SOME site, it can't
+        // boot with none, so "no match" must never mean "nothing is current").
+        $rows = $conn->query("SELECT LID, SERVER_NAME, DOC_ROOT, ACTIVE, SORT FROM b_lang ORDER BY SORT ASC, LID ASC")->fetch_all(MYSQLI_ASSOC);
         $currentHost = currentRequestHost();
-        return array_map(function ($r) use ($currentHost) {
+
+        $sites = array_map(function ($r) use ($currentHost) {
             $docRoot = (string)$r['DOC_ROOT'];
             $active  = $r['ACTIVE'] === 'Y';
             return [
-                'site_id'       => $r['LID'],
-                'domain'        => $r['SERVER_NAME'],
-                'doc_root'      => $docRoot,
-                'active'        => $active,
-                'is_current'    => $active && $r['SERVER_NAME'] !== '' && normalizeHost($r['SERVER_NAME']) === $currentHost,
-                'external_root' => $docRoot !== '' && rtrim($docRoot, '/') !== rtrim(__DIR__, '/'),
-                // Bitrix's conventional default site ID — shown as a fallback
-                // reference point when no site matches the current host at all.
-                'is_default'    => $active && $r['LID'] === 's1',
+                'site_id'          => $r['LID'],
+                'domain'           => $r['SERVER_NAME'],
+                'doc_root'         => $docRoot,
+                'active'           => $active,
+                'domain_matches'   => $active && $r['SERVER_NAME'] !== '' && normalizeHost($r['SERVER_NAME']) === $currentHost,
+                'external_root'    => $docRoot !== '' && rtrim($docRoot, '/') !== rtrim(__DIR__, '/'),
             ];
         }, $rows ?: []);
+
+        // Prefer a genuine domain match; otherwise fall back to the first
+        // enabled site in SORT order — the same resolution Bitrix itself uses.
+        $matchIdx = null;
+        foreach ($sites as $i => $s) {
+            if ($s['domain_matches']) { $matchIdx = $i; break; }
+        }
+        $matchedByDomain = $matchIdx !== null;
+        if ($matchIdx === null) {
+            foreach ($sites as $i => $s) {
+                if ($s['active']) { $matchIdx = $i; break; }
+            }
+        }
+
+        foreach ($sites as $i => &$s) {
+            $s['is_current']    = $i === $matchIdx;
+            $s['matched_by']    = $i === $matchIdx ? ($matchedByDomain ? 'domain' : 'fallback') : null;
+            unset($s['domain_matches']);
+        }
+        unset($s);
+        return $sites;
     } catch (Throwable $e) {
         return [];
     }
@@ -2281,6 +2301,46 @@ function handleBitrixAdminAuth(): never
     exit;
 }
 
+/**
+ * Ground truth for "which site is current", straight from Bitrix's own
+ * kernel — bootstraps bitrix/header.php (output suppressed, no Authorize/
+ * redirect) and reads the SITE_ID constant it resolves, rather than
+ * reimplementing CSite::GetCurByDomain()'s matching/fallback rules
+ * ourselves and hoping they're right. Explicit opt-in action only — NOT
+ * run automatically on every scan, since bootstrapping the full kernel has
+ * real side effects (analytics hits, agent crons, etc.) that shouldn't fire
+ * silently and repeatedly.
+ */
+function handleBitrixVerifySite(): void
+{
+    $docRoot = rtrim($_SERVER['DOCUMENT_ROOT'] ?? '', '/');
+    $header  = $docRoot !== '' ? $docRoot . '/bitrix/header.php' : '';
+    if ($header === '' || !file_exists($header)) {
+        $header = __DIR__ . '/bitrix/header.php';
+    }
+    if (!file_exists($header)) {
+        jsonErr('bitrix/header.php not found — this script is not sitting inside a Bitrix site root.');
+    }
+    if (!defined('NO_KEEP_STATISTIC')) {
+        define('NO_KEEP_STATISTIC', true);
+    }
+    if (!defined('NOT_CHECK_PERMISSIONS')) {
+        define('NOT_CHECK_PERMISSIONS', true);
+    }
+    try {
+        ob_start();
+        require $header;
+        ob_end_clean();
+    } catch (Throwable $e) {
+        ob_end_clean();
+        jsonErr('Failed to bootstrap Bitrix kernel: ' . $e->getMessage());
+    }
+    if (!defined('SITE_ID')) {
+        jsonErr('Bitrix bootstrapped, but SITE_ID was not defined');
+    }
+    jsonOk(['site_id' => SITE_ID]);
+}
+
 // ── HTML / UI ─────────────────────────────────────────────────────────────────
 
 function showHtml(): never
@@ -3110,29 +3170,34 @@ async function runAutoScan() {
 
           <!-- Section 2: Sites -->
           <div style="background:#0f1117;border:1px solid #2d3148;border-radius:8px;padding:14px">
-            <div style="font-size:13px;font-weight:700;color:#ffffff;margin-bottom:10px">🌐 Sites <span style="font-weight:400;color:#64748b;font-size:11px">(b_lang)</span></div>
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+              <div style="font-size:13px;font-weight:700;color:#ffffff">🌐 Sites <span style="font-weight:400;color:#64748b;font-size:11px">(b_lang)</span></div>
+              <button class="btn btn-secondary btn-sm" onclick="verifyBitrixSite()">Verify via Bitrix core</button>
+            </div>
+            <p style="font-size:12px;color:#64748b;margin-bottom:10px">Bitrix always resolves every request to some site — MATCHED below is our best-effort guess (domain match, or the first enabled site as fallback). Click "Verify via Bitrix core" to get the real answer straight from Bitrix's own kernel.</p>
+            <div id="bitrix-verify-result" style="font-size:12px;margin-bottom:10px"></div>
             ${externalSites.length ? `<div style="background:#78350f55;border:1px solid #facc15;border-radius:6px;padding:8px 12px;color:#fde68a;font-size:13px;margin-bottom:10px">⚠ ${externalSites.length} site(s) have a separate document root — back those up independently.</div>` : ''}
             <table style="width:100%;border-collapse:separate;border-spacing:0 8px">
               ${bitrixSites.map(s => {
-                const isDefaultBadge = !s.is_current && s.is_default;
-                const border = s.is_current ? '#4ade80' : (isDefaultBadge ? '#f97316' : '#2d3148');
-                const bg = s.is_current ? '#052e2255' : (isDefaultBadge ? '#7c2d1233' : '#1a1d27');
+                const isFallback = s.is_current && s.matched_by === 'fallback';
+                const border = s.is_current ? (s.matched_by === 'domain' ? '#4ade80' : '#f97316') : '#2d3148';
+                const bg = s.is_current ? (s.matched_by === 'domain' ? '#052e2255' : '#7c2d1233') : '#1a1d27';
                 return `
-                <tr style="background:${bg}">
+                <tr id="bitrix-site-row-${escHtml(s.site_id)}" style="background:${bg}">
                   <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};border-left:1px solid ${border};border-radius:8px 0 0 8px;padding:10px 12px;width:1%;white-space:nowrap">
                     <span style="font-family:monospace;font-size:12px;color:#94a3b8;background:#0f1117;border-radius:4px;padding:2px 8px">${escHtml(s.site_id||'')}</span>
                   </td>
-                  <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};padding:10px 12px;font-size:14px;font-weight:700;color:${s.is_current ? '#4ade80' : '#e2e8f0'}">
+                  <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};padding:10px 12px;font-size:14px;font-weight:700;color:${s.is_current ? '#e2e8f0' : '#e2e8f0'}">
                     ${escHtml(s.domain || '(no domain set)')}
                   </td>
                   <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};padding:10px 12px;width:1%;white-space:nowrap;font-size:11px;font-weight:700;color:${s.active ? '#4ade80' : '#ef4444'}" title="b_lang.ACTIVE — is this site row enabled at all">
                     ${s.active ? '● ENABLED' : '● DISABLED'}
                   </td>
                   <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};padding:10px 12px;width:1%;white-space:nowrap">
-                    ${s.is_current ? `<span style="font-size:11px;font-weight:700;color:#052e22;background:#4ade80;border-radius:4px;padding:2px 8px">MATCHED</span>` : ''}
+                    ${s.is_current && s.matched_by === 'domain' ? `<span style="font-size:11px;font-weight:700;color:#052e22;background:#4ade80;border-radius:4px;padding:2px 8px">MATCHED</span>` : ''}
                   </td>
                   <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};padding:10px 12px;width:1%;white-space:nowrap">
-                    ${isDefaultBadge ? `<span style="font-size:11px;font-weight:700;color:#ffffff;background:#f97316;border-radius:4px;padding:2px 8px">DEFAULT</span>` : ''}
+                    ${isFallback ? `<span style="font-size:11px;font-weight:700;color:#ffffff;background:#f97316;border-radius:4px;padding:2px 8px">FALLBACK</span>` : ''}
                   </td>
                   <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};border-right:1px solid ${border};border-radius:0 8px 8px 0;padding:10px 12px;width:1%;white-space:nowrap;font-family:monospace;font-size:11px;color:${s.external_root ? '#facc15' : 'transparent'}">
                     ${s.external_root ? escHtml(s.doc_root) : ''}
@@ -3301,6 +3366,23 @@ async function fixBitrixDomain() {
     return;
   }
   runAutoScan();
+}
+
+async function verifyBitrixSite() {
+  const result = document.getElementById('bitrix-verify-result');
+  result.innerHTML = '<span style="color:#94a3b8">Bootstrapping Bitrix kernel…</span>';
+  const r = await post('bitrix_verify_site', {});
+  if (!r.ok) {
+    result.innerHTML = `<span style="color:#ef4444">✗ ${escHtml(r.error)}</span>`;
+    return;
+  }
+  const guessedRight = fwData.bitrix_sites?.find(s => s.is_current)?.site_id === r.site_id;
+  result.innerHTML = `<span style="color:#4ade80">✓ Bitrix's kernel resolved this request to site "${escHtml(r.site_id)}"</span>` +
+    (guessedRight ? ` <span style="color:#64748b">— matches our own guess above.</span>` : ` <span style="color:#facc15">— differs from our guess above! Trusting this over the heuristic.</span>`);
+  // Highlight the confirmed row directly
+  document.querySelectorAll('[id^="bitrix-site-row-"]').forEach(row => row.style.outline = '');
+  const confirmedRow = document.getElementById('bitrix-site-row-' + r.site_id);
+  if (confirmedRow) confirmedRow.style.outline = '2px solid #4ade80';
 }
 
 // ── SQL Console — tabbed, persisted to localStorage ────────────────────────────
