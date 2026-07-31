@@ -999,6 +999,9 @@ function detectFrameworkDir(string $dir): string
     if (is_dir($dir . '/wa-system') || (is_dir($dir . '/wa-apps') && is_dir($dir . '/wa-config'))) {
         return 'webasyst';
     }
+    if (file_exists($dir . '/setup.php') && file_exists($dir . '/includes/db.php') && file_exists($dir . '/includes/settings.php')) {
+        return 'fslcms';
+    }
     return 'unknown';
 }
 
@@ -1096,6 +1099,17 @@ function extractDbCredentials(string $dir, string $fw): array
                 break;
             }
             break;
+
+        case 'fslcms':
+            $src = @file_get_contents($dir . '/setup.php');
+            if (!$src) break;
+            $map = ['DBHOST' => 'db_host', 'DBLOGIN' => 'db_user', 'DBPASSWORD' => 'db_pass', 'DBNAME' => 'db_name'];
+            foreach ($map as $const => $key) {
+                if (preg_match('/define\s*\(\s*[\'"]' . $const . '[\'"]\s*,\s*[\'"]([^\'"]*)[\'"]/', $src, $m)) {
+                    $c[$key] = $m[1];
+                }
+            }
+            break;
     }
     return $c;
 }
@@ -1126,6 +1140,9 @@ function extractSiteUrl(string $dir, string $fw): ?string
                     return rtrim($m[1], '/');
                 }
             }
+            return null;
+        case 'fslcms':
+            // FSLCMS derives its base URL from $_SERVER['SERVER_NAME'] at request time — never stored in config.
             return null;
         default:
             // Bitrix stores the site URL in the b_lang/b_option DB tables, not a config file.
@@ -1808,6 +1825,7 @@ function handleUpdateConfig(): void
         'wordpress' => cfgWordPress($rootDir, $cfg),
         'modx'      => cfgModx($rootDir, $cfg),
         'webasyst'  => cfgWebasyst($rootDir, $cfg),
+        'fslcms'    => cfgFslcms($rootDir, $cfg),
         default     => jsonErr("Unknown framework: {$fw}"),
     };
     jsonOk(['results' => $res]);
@@ -1950,6 +1968,27 @@ function cfgWebasyst(string $dir, array $c): array
     return $res ?: ['No Webasyst config files found'];
 }
 
+function cfgFslcms(string $dir, array $c): array
+{
+    $f = $dir . '/setup.php';
+    if (!file_exists($f)) {
+        return ['setup.php not found'];
+    }
+    $s   = file_get_contents($f);
+    // Site URL is derived from $_SERVER['SERVER_NAME'] at runtime — no site_url rewrite here.
+    $map = ['DBHOST' => $c['host'], 'DBLOGIN' => $c['user'], 'DBPASSWORD' => $c['pass'], 'DBNAME' => $c['db']];
+    foreach ($map as $k => $v) {
+        $safe = phpStrEscape($v);
+        $s = preg_replace(
+            "/define\s*\(\s*['\"]" . $k . "['\"]\s*,\s*['\"][^'\"]*['\"]\s*\)/",
+            "define('{$k}', '{$safe}')",
+            $s
+        );
+    }
+    file_put_contents($f, $s);
+    return ['Updated setup.php'];
+}
+
 /**
  * Resolve a user-supplied directory path and verify it is within EXTRACT_DIR.
  * Calls jsonErr() and exits on failure.
@@ -2014,6 +2053,7 @@ function handleClearCache(): void
         'wordpress' => [$dir . '/wp-content/cache'],
         'modx'      => [$dir . '/core/cache', $dir . '/assets/cache'],
         'webasyst'  => [$dir . '/wa-cache'],
+        'fslcms'    => [$dir . '/cache'],
         default     => [],
     };
 
