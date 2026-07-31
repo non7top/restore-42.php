@@ -235,6 +235,29 @@ function detectBitrixPresent(): bool
         || file_exists(dirname(__DIR__) . '/bitrix/.settings.php');
 }
 
+/**
+ * Bitrix's own core (main module) version, read from the same file its
+ * "Product Update" admin screen reads: bitrix/modules/main/install/version.php,
+ * which defines $arModuleVersion['VERSION']. Read as plain text and
+ * regex-extracted rather than included, so a tampered file can't execute
+ * arbitrary code in this process.
+ */
+function detectBitrixVersion(string $fwRoot): ?string
+{
+    $file = rtrim($fwRoot, '/') . '/bitrix/modules/main/install/version.php';
+    if (!is_file($file)) {
+        return null;
+    }
+    $content = @file_get_contents($file, false, null, 0, 4096);
+    if ($content === false) {
+        return null;
+    }
+    if (preg_match('/[\'"]VERSION[\'"]\s*=>\s*[\'"]([\d.]+)[\'"]/', $content, $m)) {
+        return $m[1];
+    }
+    return null;
+}
+
 function authClearCookie(): void
 {
     setcookie(AUTH_COOKIE, '', ['expires' => 1, 'path' => '/', 'httponly' => true, 'samesite' => 'Strict']);
@@ -864,7 +887,8 @@ function handleScan(): void
     $prefix  = extractTablePrefix($fwRoot, $fw);
     $bitrixSites   = $fw === 'bitrix' ? detectBitrixSites($dbCreds) : [];
     $bitrixDevMode = $fw === 'bitrix' ? getBitrixDevMode($dbCreds) : null;
-    $bitrixDomain  = $fw === 'bitrix' ? detectBitrixDomainMismatch($dbCreds, $bitrixSites) : null;
+    $bitrixDomain  = $fw === 'bitrix' ? detectBitrixDomainMismatch($dbCreds) : null;
+    $bitrixVersion = $fw === 'bitrix' ? detectBitrixVersion($fwRoot) : null;
     // matched_by is 'domain' or 'fallback' at this point (set inside
     // detectBitrixSites()) — the browser overrides this client-side with a
     // 'kernel'-verified result via its own fetch() to bitrix_site_id_internal,
@@ -888,6 +912,7 @@ function handleScan(): void
         'bitrix_sites'      => $bitrixSites,
         'bitrix_dev_mode'   => $bitrixDevMode,
         'bitrix_domain_check' => $bitrixDomain,
+        'bitrix_version'    => $bitrixVersion,
         'current_host'      => $fw === 'bitrix' ? currentRequestHost() : null,
     ]);
 }
@@ -1252,9 +1277,14 @@ function detectBitrixSites(array $dbCreds): array
             $matchIdx = 0;
         }
 
+        // is_default reflects b_lang's real DEF flag — a static fact about
+        // this site, shown regardless of whether it also happens to be the
+        // currently-matched one (unlike matched_by:'fallback', which only
+        // applies when no domain matched at all).
         foreach ($sites as $i => &$s) {
             $s['is_current']    = $i === $matchIdx;
             $s['matched_by']    = $i === $matchIdx ? ($matchedByDomain ? 'domain' : 'fallback') : null;
+            $s['is_default']    = $s['is_default_flag'];
             unset($s['domain_matches'], $s['is_default_flag']);
         }
         unset($s);
@@ -1294,14 +1324,19 @@ function getBitrixDevMode(array $dbCreds): ?string
 }
 
 /**
- * Diagnose the classic Bitrix session-breaking bug: main.server_name (Main
- * module settings) disagreeing with the domain actually bound to the active
- * site in b_lang. Resolution order for "what the domain SHOULD be":
- * b_lang's SERVER_NAME for an active site (the actual routing table) first,
- * falling back to main.site_name if no site has one set — using both
- * available signals rather than trusting either alone.
+ * Compare main.server_name (Main module, b_option) against the domain this
+ * very request actually arrived on. Confirmed directly via a live Set-Cookie
+ * header: Bitrix sets the session cookie's Domain attribute from this value,
+ * and browsers reject the cookie outright when it doesn't match the site
+ * actually being visited — nobody stays logged in until it's fixed. Also
+ * used to build absolute URLs outside of a request context (cron agents,
+ * notifications, RSS/sitemaps). A stored config value can go stale (e.g.
+ * after moving a site prod->dev or back), but the current request's Host
+ * header cannot: it's what's really being used right now. main.site_name
+ * is shown for reference only; it's not compared here (unconfirmed whether
+ * it's even meant to hold a domain — see main.server_name's own field).
  */
-function detectBitrixDomainMismatch(array $dbCreds, array $bitrixSites): ?array
+function detectBitrixDomainMismatch(array $dbCreds): ?array
 {
     if (empty($dbCreds['db_host']) || empty($dbCreds['db_name'])) {
         return null;
@@ -1320,20 +1355,13 @@ function detectBitrixDomainMismatch(array $dbCreds, array $bitrixSites): ?array
             $opts[$row['NAME']] = $row['VALUE'];
         }
 
-        $fromLang = null;
-        foreach ($bitrixSites as $s) {
-            if (!empty($s['domain'])) {
-                $fromLang = $s['domain'];
-                break;
-            }
-        }
-        $resolved = $fromLang ?: ($opts['site_name'] ?: null);
+        $currentHost = currentRequestHost();
 
         return [
-            'server_name'     => $opts['server_name'],
-            'site_name'       => $opts['site_name'],
-            'resolved_domain' => $resolved,
-            'mismatch'        => $resolved !== null && $opts['server_name'] !== $resolved,
+            'server_name'  => $opts['server_name'],
+            'site_name'    => $opts['site_name'],
+            'current_host' => $currentHost,
+            'mismatch'     => $opts['server_name'] !== null && $currentHost !== '' && normalizeHost($opts['server_name']) !== $currentHost,
         ];
     } catch (Throwable $e) {
         return null;
@@ -1351,25 +1379,20 @@ function handleBitrixFixDomain(): void
     if (empty($dbCreds['db_host']) || empty($dbCreds['db_name'])) {
         jsonErr('Could not resolve Bitrix DB credentials');
     }
+    $target = currentRequestHost();
+    if ($target === '') {
+        jsonErr('Could not determine the current request host');
+    }
     try {
         $conn = dbConnect($dbCreds['db_host'], $dbCreds['db_user'] ?? '', $dbCreds['db_pass'] ?? '', (int)($dbCreds['db_port'] ?? 3306), $dbCreds['db_name']);
 
-        $bitrixSites = detectBitrixSites($dbCreds);
-        $mismatch    = detectBitrixDomainMismatch($dbCreds, $bitrixSites);
-        $target      = $mismatch['resolved_domain'] ?? null;
-        if (!$target) {
-            jsonErr('Could not determine the correct domain — no b_lang site has a SERVER_NAME and main.site_name is empty.');
-        }
-
-        foreach (['server_name', 'site_name'] as $name) {
-            $stmt = $conn->prepare("UPDATE b_option SET VALUE = ? WHERE MODULE_ID = 'main' AND NAME = ?");
-            $stmt->bind_param('ss', $target, $name);
-            $stmt->execute();
-            if ($conn->affected_rows === 0) {
-                $ins = $conn->prepare("INSERT INTO b_option (MODULE_ID, NAME, VALUE) VALUES ('main', ?, ?)");
-                $ins->bind_param('ss', $name, $target);
-                $ins->execute();
-            }
+        $stmt = $conn->prepare("UPDATE b_option SET VALUE = ? WHERE MODULE_ID = 'main' AND NAME = 'server_name'");
+        $stmt->bind_param('s', $target);
+        $stmt->execute();
+        if ($conn->affected_rows === 0) {
+            $ins = $conn->prepare("INSERT INTO b_option (MODULE_ID, NAME, VALUE) VALUES ('main', 'server_name', ?)");
+            $ins->bind_param('s', $target);
+            $ins->execute();
         }
         jsonOk(['domain' => $target]);
     } catch (Throwable $e) {
@@ -3123,6 +3146,7 @@ async function runAutoScan() {
           ? `<span style="display:inline-flex;align-items:center;gap:6px;background:${fwColor}22;color:${fwColor};border:1px solid ${fwColor}44;border-radius:6px;padding:6px 14px;font-weight:600;font-size:14px">${fw}</span>`
           : `<span style="color:#64748b;font-size:13px">No files extracted yet</span>`}
         ${scan.live_site ? `<span style="margin-left:8px;font-size:11px;color:#64748b">(detected from the live site — no backup extracted yet)</span>` : ''}
+        ${fw === 'bitrix' && scan.bitrix_version ? `<span style="margin-left:8px;font-size:12px;color:#94a3b8">core v${escHtml(scan.bitrix_version)}</span>` : ''}
       </div>
 
       ${hasFiles ? `
@@ -3186,51 +3210,50 @@ async function runAutoScan() {
           <!-- Section 1: Main Module Settings -->
           <div style="background:#0f1117;border:1px solid #2d3148;border-radius:8px;padding:14px;margin-bottom:12px">
             <div style="font-size:13px;font-weight:700;color:#ffffff;margin-bottom:4px">📋 Main Module Settings <span style="font-weight:400;color:#64748b;font-size:11px">(b_option)</span></div>
-            <p style="font-size:12px;color:#94a3b8;margin-bottom:12px;line-height:1.5">These two values are both stored in Bitrix's own config and should agree with each other — unrelated to how you're browsing this admin tool right now.</p>
+            <p style="font-size:12px;color:#94a3b8;margin-bottom:12px;line-height:1.5">main.server_name sets the <code>Domain</code> attribute on the session cookie (confirmed directly: Set-Cookie's domain= comes from this value) and is used to build absolute URLs outside of a request context — cron agents, notifications, RSS/sitemaps. Browsers reject a cookie whose Domain doesn't match the site actually being visited, so a stale value here silently breaks logins. It should match the domain this install is actually being reached on <em>right now</em>, since a stored value can go stale (e.g. after moving a site prod↔dev and forgetting to revert it back).</p>
             ${domainCheck ? `
               <div style="display:flex;flex-wrap:wrap;gap:20px;margin-bottom:10px">
                 <div>
-                  <div style="font-size:11px;color:#94a3b8;margin-bottom:3px">server_name</div>
+                  <div style="font-size:11px;color:#94a3b8;margin-bottom:3px">server_name (b_option)</div>
                   <div style="font-family:monospace;font-size:14px;font-weight:700;color:${domainCheck.mismatch ? '#f87171' : '#4ade80'}">${escHtml(domainCheck.server_name || '(not set)')}</div>
                 </div>
                 <div>
-                  <div style="font-size:11px;color:#94a3b8;margin-bottom:3px">site_name</div>
-                  <div style="font-family:monospace;font-size:14px;font-weight:700;color:#e2e8f0">${escHtml(domainCheck.site_name || '(not set)')}</div>
+                  <div style="font-size:11px;color:#94a3b8;margin-bottom:3px">you're currently browsing via</div>
+                  <div style="font-family:monospace;font-size:14px;font-weight:700;color:#5eead4">${escHtml(domainCheck.current_host || '?')}</div>
                 </div>
                 <div>
-                  <div style="font-size:11px;color:#94a3b8;margin-bottom:3px">expected (from site list)</div>
-                  <div style="font-family:monospace;font-size:14px;font-weight:700;color:#5eead4">${escHtml(domainCheck.resolved_domain || '?')}</div>
+                  <div style="font-size:11px;color:#94a3b8;margin-bottom:3px">site_name (b_option, reference only)</div>
+                  <div style="font-family:monospace;font-size:14px;font-weight:700;color:#e2e8f0">${escHtml(domainCheck.site_name || '(not set)')}</div>
                 </div>
               </div>
               ${domainCheck.mismatch ? `
                 <div style="background:#7f1d1d55;border:1px solid #f87171;border-radius:6px;padding:10px 12px;color:#fecaca;font-size:13px;line-height:1.6">
-                  ⚠ <strong>server_name ("${escHtml(domainCheck.server_name)}") does not match site_name / the site's bound domain ("${escHtml(domainCheck.resolved_domain)}").</strong>
-                  Bitrix internally thinks this installation lives at <strong>${escHtml(domainCheck.server_name)}</strong>, but the site is actually configured for <strong>${escHtml(domainCheck.resolved_domain)}</strong>. This disagreement between the two stored values is a documented cause of broken sessions.
-                  <div style="margin-top:8px"><button class="btn btn-primary btn-sm" onclick="fixBitrixDomain()">Set server_name to "${escHtml(domainCheck.resolved_domain)}"</button></div>
+                  ⚠ <strong>server_name ("${escHtml(domainCheck.server_name)}") doesn't match the domain you're currently on ("${escHtml(domainCheck.current_host)}").</strong>
+                  If that's expected right now (e.g. you're mid prod↔dev move), ignore this. Otherwise, the session cookie's Domain is being set to "${escHtml(domainCheck.server_name)}" — browsers reject that on "${escHtml(domainCheck.current_host)}", so nobody can stay logged in until this is updated.
+                  <div style="margin-top:8px"><button class="btn btn-primary btn-sm" onclick="fixBitrixDomain()">Set server_name to "${escHtml(domainCheck.current_host)}"</button></div>
                 </div>` : `
-                <div style="background:#052e2255;border:1px solid #4ade80;border-radius:6px;padding:8px 12px;color:#bbf7d0;font-size:13px">✓ server_name matches site_name / the site's bound domain — no mismatch here.</div>`}
+                <div style="background:#052e2255;border:1px solid #4ade80;border-radius:6px;padding:8px 12px;color:#bbf7d0;font-size:13px">✓ server_name matches the domain you're currently on — no mismatch here.</div>`}
             ` : `<div style="color:#94a3b8;font-size:13px">Could not read b_option (connection failed or credentials missing).</div>`}
           </div>
 
           <!-- Section 2: Sites -->
           <div style="background:#0f1117;border:1px solid #2d3148;border-radius:8px;padding:14px">
             <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
-              <div style="font-size:13px;font-weight:700;color:#ffffff">🌐 Sites <span style="font-weight:400;color:#64748b;font-size:11px">(b_lang)</span></div>
+              <div style="font-size:13px;font-weight:700;color:#ffffff">🌐 Sites <span style="font-weight:400;color:#64748b;font-size:11px">(b_lang)</span>
+                ${scan.bitrix_kernel_verified ? `<span title="ACTIVE below is confirmed directly from Bitrix's own kernel (SITE_ID) — not a guess." style="cursor:help;color:#4ade80;font-size:12px;margin-left:6px">✓ⓘ</span>` : ''}
+              </div>
               <button class="btn btn-secondary btn-sm" onclick="verifyBitrixSite()">Re-verify via Bitrix core</button>
             </div>
-            ${scan.bitrix_kernel_verified ? `
-              <div style="background:#052e2255;border:1px solid #4ade80;border-radius:6px;padding:8px 12px;color:#bbf7d0;font-size:13px;margin-bottom:10px">✓ ACTIVE below is confirmed directly from Bitrix's own kernel (SITE_ID) — not a guess.</div>
-            ` : `
+            ${!scan.bitrix_kernel_verified ? `
               <div style="background:#78350f55;border:1px solid #facc15;border-radius:6px;padding:8px 12px;color:#fde68a;font-size:13px;margin-bottom:10px">⚠ Could not verify the active site via Bitrix's kernel (bootstrap failed, or bitrix/header.php wasn't found here). ACTIVE below reflects a real domain match if one exists; DEFAULT reads b_lang's own DEF flag (Bitrix's recorded default site) as the fallback when no domain matched.</div>
-            `}
+            ` : ''}
             <div id="bitrix-verify-result" style="font-size:12px;margin-bottom:10px"></div>
             ${externalSites.length ? `<div style="background:#78350f55;border:1px solid #facc15;border-radius:6px;padding:8px 12px;color:#fde68a;font-size:13px;margin-bottom:10px">⚠ ${externalSites.length} site(s) have a separate document root — back those up independently.</div>` : ''}
             <table style="width:100%;border-collapse:separate;border-spacing:0 8px">
               ${bitrixSites.map(s => {
                 const isActive = s.is_current && (s.matched_by === 'domain' || s.matched_by === 'kernel');
-                const isFallback = s.is_current && s.matched_by === 'fallback';
-                const border = isActive ? '#4ade80' : (isFallback ? '#f97316' : '#2d3148');
-                const bg = isActive ? '#052e2255' : (isFallback ? '#7c2d1233' : '#1a1d27');
+                const border = isActive ? '#4ade80' : (s.is_default ? '#f97316' : '#2d3148');
+                const bg = isActive ? '#052e2255' : (s.is_default ? '#7c2d1233' : '#1a1d27');
                 return `
                 <tr id="bitrix-site-row-${escHtml(s.site_id)}" style="background:${bg}">
                   <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};border-left:1px solid ${border};border-radius:8px 0 0 8px;padding:10px 12px;width:1%;white-space:nowrap">
@@ -3245,8 +3268,8 @@ async function runAutoScan() {
                   <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};padding:10px 12px;width:1%;white-space:nowrap">
                     ${isActive ? `<span style="font-size:11px;font-weight:700;color:#052e22;background:#4ade80;border-radius:4px;padding:2px 8px">ACTIVE${s.matched_by === 'kernel' ? ' ✓' : ''}</span>` : ''}
                   </td>
-                  <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};padding:10px 12px;width:1%;white-space:nowrap">
-                    ${isFallback ? `<span style="font-size:11px;font-weight:700;color:#ffffff;background:#f97316;border-radius:4px;padding:2px 8px">DEFAULT</span>` : ''}
+                  <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};padding:10px 12px;width:1%;white-space:nowrap" title="b_lang.DEF — Bitrix's own recorded default site">
+                    ${s.is_default ? `<span style="font-size:11px;font-weight:700;color:#ffffff;background:#f97316;border-radius:4px;padding:2px 8px">DEFAULT</span>` : ''}
                   </td>
                   <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};border-right:1px solid ${border};border-radius:0 8px 8px 0;padding:10px 12px;width:1%;white-space:nowrap;font-family:monospace;font-size:11px;color:${s.external_root ? '#facc15' : 'transparent'}">
                     ${s.external_root ? escHtml(s.doc_root) : ''}
@@ -3379,13 +3402,16 @@ function renderDevModeStatus(scan) {
 
   // Heuristic: a 3+ part domain (e.g. dev.example.com, test.example.com)
   // often signals a staging/dev subdomain rather than the real production
-  // domain — flag it when the site is claiming to be PROD.
+  // domain — flag it when the site is claiming to be PROD. Check the domain
+  // this admin tool is actually being browsed on (current_host), not the
+  // matched b_lang site's configured SERVER_NAME — those can differ (e.g.
+  // a hosting-panel preview subdomain pointed at a site whose real b_lang
+  // domain is already the production one).
   if (warn) {
     warn.style.display = 'none';
-    const current = (scan.bitrix_sites || []).find(s => s.is_current);
-    const domain  = current?.domain || '';
+    const domain = scan.current_host || '';
     if (value === 'N' && domain && domain.split('.').length >= 3) {
-      warn.textContent = `⚠ Domain "${domain}" has 3+ parts (looks like a dev/staging subdomain) but this site reports PROD mode — double check that's intentional.`;
+      warn.textContent = `⚠ You're browsing this tool via "${domain}", which has 3+ parts (looks like a dev/staging subdomain), but this site reports PROD mode — double check that's intentional.`;
       warn.style.display = '';
     }
   }
@@ -3408,7 +3434,7 @@ async function toggleDevMode() {
 async function fixBitrixDomain() {
   if (!fwData.root) return;
   const check = fwData.bitrix_domain_check;
-  if (!confirm(`Set main.server_name AND main.site_name to "${check?.resolved_domain}"?\n\nThis directly modifies the b_option table. Continue?`)) return;
+  if (!confirm(`Set main.server_name to "${check?.current_host}" (the domain you're currently browsing this tool on)?\n\nThis directly modifies the b_option table. Continue?`)) return;
   const r = await post('bitrix_fix_domain', {dir: fwData.root});
   if (!r.ok) {
     alert('✗ ' + r.error);

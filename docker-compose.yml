@@ -9,6 +9,10 @@ services:
       - "8080:8080"
     volumes:
       - ./:/var/www/html
+      # Read-only override for the tracked script itself — local test logins
+      # would otherwise self-embed a password hash into the actual source
+      # file via file_put_contents(__FILE__, ...), polluting git status.
+      - ./restore-42.php:/var/www/html/restore-42.php:ro
     depends_on:
       db:
         condition: service_healthy
