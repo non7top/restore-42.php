@@ -1,1 +1,10 @@
 .restore/
+restore_work/
+restore_backups/
+
+# restore-5.php IS tracked, deliberately — see THIRD-PARTY-NOTICES.md for what
+# it is, why an old release is retained, and the basis for including it.
+
+# Saved third-party web page — someone else's article rather than a tool this
+# repo depends on, so there's no interoperability argument for keeping it.
+*.htm
