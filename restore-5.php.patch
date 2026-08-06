@@ -1,0 +1,129 @@
+diff --git a/restore-5.php b/restore-5.php
+index 1a02a48..6701be1 100644
+--- a/restore-5.php
++++ b/restore-5.php
+@@ -398,6 +398,21 @@ if (!$Step)
+ 	$bx_url = '/download/files/scripts/'.$this_script_name;
+ 	$form = '';
+ 
++	// --- SELF-UPDATE DISABLED (wr-util) ---------------------------------
++	// This is deliberately an OLD version of Bitrix's restore.php, kept
++	// because it understands the old backup format the site being restored
++	// was produced with. The block below compared this file's size against
++	// the copy currently published at www.1c-bitrix.ru and, on any
++	// difference, downloaded that copy and rename()'d it over __FILE__ —
++	// i.e. it would silently replace this old script with the current one on
++	// first load, which is exactly the opposite of what's wanted here, and
++	// it happens before any restore work begins.
++	//
++	// Commented out rather than deleted so the original flow stays readable
++	// and this is trivially reversible. Nothing below depends on it: it only
++	// ever set $strErrMsg (already initialised to '' above) or terminated the
++	// request outright.
++	/*
+ 	// Check for updates
+ 	$res = @fsockopen($bx_host, 80, $errno, $errstr, 3);
+ 
+@@ -435,6 +450,8 @@ if (!$Step)
+ 		}
+ 		fclose($res);
+ 	}
++	*/
++	// --- end self-update block -------------------------------------------
+ }
+ 
+ if ($_REQUEST['LoadFileList'])
+@@ -2624,22 +2641,88 @@ class CTarRestore extends CTar
+ 			else
+ 				$this->EncCurrent = 'utf-8';
+ 
+-			if (preg_match("/[\xe0\xe1\xe3-\xff]/",$str))
+-				$this->EncRemote = 'cp1251';
++			// --- wr-util: encoding detection replaced --------------------
++			// Stock order was: probe the RAW bytes for /[\xe0\xe1\xe3-\xff]/
++			// and call it cp1251, else transcode utf8->cp1251 and probe again
++			// for utf8, else abort. That probe covers only cp1251 Russian
++			// LOWERCASE (not even 'в', 0xE2), so a name in uppercase Cyrillic
++			// satisfies neither test. Confirmed live on this very archive:
++			//   upload/iblock/944/140УД12.pdf
++			//   raw   = ... d0 a3 d0 94 ...   (valid UTF-8: У, Д)
++			//   ->cp1251 = ... d3 c4 ...      (correct, but both < 0xE0)
++			// Perfectly well-formed UTF-8, yet the whole restore aborted.
++			//
++			// Widening the probe to \xc0-\xff is NOT a valid fix: the raw
++			// UTF-8 lead byte 0xD0 lands inside that range, so step 1 would
++			// then mislabel this UTF-8 name as cp1251 and mangle it. UTF-8
++			// validity must be decided FIRST — a byte-range test cannot
++			// distinguish the two once the ranges overlap.
++			if (function_exists('mb_check_encoding') && mb_check_encoding($str, 'UTF-8'))
++				$this->EncRemote = 'utf8';
++			elseif (preg_match("/[\xa8\xb8\xc0-\xff]/",$str))
++				$this->EncRemote = 'cp1251'; // full cp1251 Cyrillic: А-я, Ё, ё
+ 			else
+ 			{
+ 				if (!function_exists('mb_convert_encoding'))
+ 					return $this->Error(getMsg('ERR_CANT_DECODE'));
+ 
+ 				$str0 = mb_convert_encoding($str, 'cp1251', 'utf8');
+-				if (preg_match("/[\xe0\xe1\xe3-\xff]/",$str0,$regs))
++				if (preg_match("/[\xa8\xb8\xc0-\xff]/",$str0,$regs))
+ 					$this->EncRemote = 'utf8';
+ 				else
+-					return $this->Error(getMsg('ERR_CANT_DETECT_ENC'));
++				{
++					// --- wr-util: expanded diagnostics ------------------------
++					// The stock message names neither the file nor the bytes,
++					// which makes this failure impossible to act on. Detection
++					// only ever probes /[\xe0\xe1\xe3-\xff]/ — cp1251 Russian
++					// LOWERCASE (and not even 'в', 0xE2) — so a first non-ASCII
++					// name made only of uppercase Russian (0xC0-0xDF), of
++					// Latin-1 accents, or of already-mangled bytes falls
++					// through both probes and aborts the whole restore. Worse,
++					// the verdict is cached in $this->EncRemote from that FIRST
++					// name alone and then applied to all 82k+ entries.
++					$hex = '';
++					for ($i = 0; $i < strlen($str); $i++)
++						$hex .= sprintf('%02x ', ord($str[$i]));
++					$hex0 = '';
++					for ($i = 0; $i < strlen($str0); $i++)
++						$hex0 .= sprintf('%02x ', ord($str0[$i]));
++					$validUtf8 = (function_exists('mb_check_encoding') && mb_check_encoding($str, 'UTF-8')) ? 'yes' : 'no';
++					$hi = array();
++					for ($i = 0; $i < strlen($str); $i++)
++					{
++						$b = ord($str[$i]);
++						if ($b > 0x7f)
++							$hi[] = sprintf('0x%02X', $b);
++					}
++					return $this->Error(
++						getMsg('ERR_CANT_DETECT_ENC') .
++						'<br><br><b>wr-util diagnostics</b><br>' .
++						'filename (raw): <code>' . htmlspecialcharsbx($str) . '</code><br>' .
++						'filename bytes: <code>' . trim($hex) . '</code><br>' .
++						'non-ASCII bytes: <code>' . implode(' ', $hi) . '</code><br>' .
++						'valid UTF-8: <b>' . $validUtf8 . '</b><br>' .
++						'after utf8&rarr;cp1251: <code>' . trim($hex0) . '</code><br>' .
++						'EncCurrent: <code>' . htmlspecialcharsbx($this->EncCurrent) . '</code><br>' .
++						'probe used: <code>/[\xe0\xe1\xe3-\xff]/</code> (cp1251 lowercase only)'
++					);
++					// --- end wr-util diagnostics ------------------------------
++				}
+ 			}
+ 		}
+ 
+-		if ($this->EncCurrent == $this->EncRemote)
++		// wr-util: compare NORMALISED names. EncCurrent is spelled 'utf-8'
++		// (line ~2642) while EncRemote is spelled 'utf8', so the stock string
++		// compare never matched for the overwhelmingly common Linux->Linux,
++		// UTF-8-both-ends case, and every filename took a pointless
++		// mb_convert_encoding('utf-8' <- 'utf8') round trip. That is an
++		// identity transform here, so nothing was corrupted — but skipping it
++		// makes the names provably byte-identical to the source rather than
++		// merely expected to be, which is what keeps them matching the paths
++		// stored in the (byte-exact restored) database.
++		$normCur = strtolower(str_replace('-', '', $this->EncCurrent));
++		$normRem = strtolower(str_replace('-', '', $this->EncRemote));
++		if ($normCur == $normRem)
+ 			return $str;
+ 		if (!function_exists('mb_convert_encoding'))
+ 			return $this->Error(getMsg('ERR_CANT_DECODE'));
