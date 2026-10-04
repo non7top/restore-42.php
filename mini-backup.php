@@ -791,9 +791,9 @@ if ($sqlName !== null) {
     // user@'127.0.0.1'.
     // --routines --events: --opt does not enable these (unlike --triggers),
     // so stored procedures/functions/events were silently dropped before.
-    $dumpBase = 'mysqldump --opt --no-tablespaces --default-character-set=binary --skip-set-charset --routines --events';
+    $dumpBase = 'mysqldump --opt --no-tablespaces $WRU_CS --default-character-set=binary --skip-set-charset --routines --events';
     // Fallback used only if the dump above fails outright -- see below.
-    $dumpBaseFallback = 'mysqldump --opt --no-tablespaces --default-character-set=binary --skip-set-charset';
+    $dumpBaseFallback = 'mysqldump --opt --no-tablespaces $WRU_CS --default-character-set=binary --skip-set-charset';
     // 2>> (append), not 2> (truncate).
     //
     // Every attempt wrote to the same error file with >, so each one erased the
@@ -806,6 +806,10 @@ if ($sqlName !== null) {
         ' ' . escapeshellarg($WRU_DB_NAME) .
         ' > ' . escapeshellarg($sqlPath) . ' 2>> ' . escapeshellarg($sqlErrFile);
     $attempts = wruMysqlConnAttempts($dbHost, $dbPort);
+    // mysqldump 8.0 reads information_schema.COLUMN_STATISTICS, which a MySQL 5.x or
+    // MariaDB server does not have, and aborts the dump. Only a mysqldump that
+    // knows the option may be given it: MariaDB's rejects it as an unknown option.
+    $sh .= 'WRU_CS=""; if mysqldump --help 2>/dev/null | grep -q -- "--column-statistics"; then WRU_CS="--column-statistics=0"; fi' . "\n";
     $sh .= ': > ' . escapeshellarg($sqlErrFile) . "\n";
     $sh .= wruBuildDumpAttemptsShell($attempts, $dumpBase, $dumpTail, $WRU_DB_PASS, $sqlErrFile);
     // A missing SHOW_ROUTINE/EVENT grant fails the WHOLE dump, not just the
