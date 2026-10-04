@@ -1,0 +1,13 @@
+# 1C-Bitrix's own restore.php (see THIRD-PARTY-NOTICES.md): tracked here so the
+# fixes are reproducible, but kept out of generated archives — `git archive`,
+# and the tarballs/ZIPs GitHub builds with it, honour export-ignore. Note this
+# is not a redistribution boundary: the files remain present in clones, in
+# history and in the web file view.
+#
+# restore-5.php.patch is deliberately NOT export-ignored — the patch is our own
+# work, and it is the part worth shipping.
+restore-5.php export-ignore
+restore-5.php.orig export-ignore
+
+# Keep PHP diffs readable.
+*.php diff=php

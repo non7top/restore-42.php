@@ -12,30 +12,59 @@ define('WORK_DIR', __DIR__ . '/.restore');
 define('UPLOADS_DIR', WORK_DIR . '/uploads');
 define('EXTRACT_DIR', WORK_DIR . '/extract');
 define('BACKUPS_DIR', WORK_DIR . '/backups');
-define('STATE_FILE', WORK_DIR . '/.state');
+define('AUTH_COOKIE', 'r42_auth');
+define('AUTH_TTL', 604800); // 7-day token lifetime
 
 error_reporting(E_ALL);
 ini_set('display_errors', '0');
 set_time_limit(0);
 ini_set('memory_limit', '512M');
 
-session_start();
+// No PHP session — auth uses a stateless HMAC-signed cookie instead.
 
-foreach ([WORK_DIR, UPLOADS_DIR, EXTRACT_DIR, BACKUPS_DIR] as $d) {
-    if (!is_dir($d)) {
-        mkdir($d, 0755, true);
+/**
+ * Create WORK_DIR and its subdirectories, access guards, and clean up
+ * abandoned upload chunks. Called lazily — only when an authenticated action
+ * actually needs the work dir — so simply loading the login screen or
+ * hitting check_auth never litters the site with an empty .restore/.
+ */
+function ensureWorkDirs(): void
+{
+    static $done = false;
+    if ($done) {
+        return;
     }
-}
-// Protect work dir from direct web access
-$htFile = WORK_DIR . '/.htaccess';
-if (!file_exists($htFile)) {
-    file_put_contents($htFile, 'Deny from all');
-}
-// Clean up chunk files abandoned for more than 1 hour (truly orphaned).
-// Do NOT delete recent chunks — they belong to an upload that is in progress.
-foreach (glob(UPLOADS_DIR . '/*.chunk*') ?: [] as $orphan) {
-    if (time() - filemtime($orphan) > 3600) {
-        unlink($orphan);
+    $done = true;
+
+    foreach ([WORK_DIR, UPLOADS_DIR, EXTRACT_DIR, BACKUPS_DIR] as $d) {
+        if (!is_dir($d)) {
+            mkdir($d, 0755, true);
+        }
+    }
+    // Protect work dir from direct web access.
+    // .htaccess only works under Apache — nginx ignores it entirely and will
+    // happily serve or list files in WORK_DIR unless its own config blocks it.
+    // index.php guards below are a defense-in-depth fallback: they stop directory
+    // listing under both servers (as long as nginx routes .php to PHP-FPM, which
+    // is the near-universal default), but do NOT stop a direct request for a
+    // specific known filename under nginx — only a server-config rule can do that.
+    $htFile = WORK_DIR . '/.htaccess';
+    if (!file_exists($htFile)) {
+        file_put_contents($htFile, "Require all denied\nDeny from all\n");
+    }
+    $denyPhp = "<?php http_response_code(403); exit('Forbidden');\n";
+    foreach ([WORK_DIR, UPLOADS_DIR, EXTRACT_DIR, BACKUPS_DIR] as $d) {
+        $guard = $d . '/index.php';
+        if (!file_exists($guard)) {
+            file_put_contents($guard, $denyPhp);
+        }
+    }
+    // Clean up chunk files abandoned for more than 1 hour (truly orphaned).
+    // Do NOT delete recent chunks — they belong to an upload that is in progress.
+    foreach (glob(UPLOADS_DIR . '/*.chunk*') ?: [] as $orphan) {
+        if (time() - filemtime($orphan) > 3600) {
+            unlink($orphan);
+        }
     }
 }
 
@@ -45,6 +74,7 @@ $action = $_REQUEST['action'] ?? '';
 
 if ($action && !in_array($action, ['login', 'check_auth'], true)) {
     requireAuth();
+    ensureWorkDirs();
 }
 
 switch ($action) {
@@ -55,7 +85,19 @@ switch ($action) {
         handleLogout();
         break;
     case 'check_auth':
-        jsonOk(['auth' => isAuth()]);
+        $authMode = STORED_PASS_HASH === '' ? 'first_run'
+                  : (str_starts_with(STORED_PASS_HASH, 'bitrix:') ? 'bitrix' : 'local');
+        // Only disclose whether Bitrix is actually present when the account is
+        // already IN bitrix-auth mode (needed to detect a broken/moved install
+        // and show the recovery message) — otherwise this is an unauthenticated
+        // endpoint and shouldn't hand anonymous callers free tech-stack recon.
+        // The login screen always offers the Bitrix option regardless; a wrong
+        // guess there just fails cleanly.
+        jsonOk([
+            'auth'             => isAuth(),
+            'mode'             => $authMode,
+            'bitrix_available' => $authMode === 'bitrix' ? detectBitrixPresent() : true,
+        ]);
         break;
     case 'upload':
         handleUpload();
@@ -71,6 +113,9 @@ switch ($action) {
         break;
     case 'scan':
         handleScan();
+        break;
+    case 'dir_size':
+        handleDirSize();
         break;
     case 'test_db':
         handleTestDb();
@@ -90,17 +135,32 @@ switch ($action) {
     case 'backup':
         handleBackup();
         break;
-    case 'get_state':
-        jsonOk(getState());
-        break;
-    case 'set_state':
-        handleSetState();
-        break;
     case 'delete_file':
         handleDeleteFile();
         break;
     case 'cancel_upload':
         handleCancelUpload();
+        break;
+    case 'verify_file':
+        handleVerifyFile();
+        break;
+    case 'download_upstream':
+        handleDownloadUpstream();
+        break;
+    case 'bitrix_login':
+        handleBitrixAdminAuth();
+        break;
+    case 'bitrix_site_id_internal':
+        handleBitrixSiteIdInternal();
+        break;
+    case 'bitrix_toggle_devmode':
+        handleBitrixToggleDevMode();
+        break;
+    case 'bitrix_fix_domain':
+        handleBitrixFixDomain();
+        break;
+    case 'run_sql':
+        handleRunSql();
         break;
     case 'download_backup':
         handleDownloadBackup();
@@ -112,9 +172,100 @@ switch ($action) {
 
 // ── Auth ─────────────────────────────────────────────────────────────────────
 
+// ── Stateless HMAC-signed auth cookie ────────────────────────────────────────
+// Token: "<expires_unix>.<hmac_sha256(expires|hash, key=hash)>"
+// Bound to STORED_PASS_HASH — re-uploading the script invalidates all tokens.
+// Sets Secure flag automatically when served over HTTPS.
+
+/**
+ * Return the HMAC signing key for auth tokens.
+ * In Bitrix-auth mode STORED_PASS_HASH is "bitrix:<64-char-hex>"; we use the
+ * hex part as the key so the format of the stored value doesn't leak into tokens.
+ */
+function authSigningKey(): string
+{
+    if (str_starts_with(STORED_PASS_HASH, 'bitrix:')) {
+        return substr(STORED_PASS_HASH, 7);
+    }
+    return STORED_PASS_HASH;
+}
+
+function authMakeToken(string $keyOverride = ''): string
+{
+    $key = $keyOverride !== '' ? $keyOverride : authSigningKey();
+    $exp = time() + AUTH_TTL;
+    $sig = hash_hmac('sha256', $exp . '|' . $key, $key);
+    return $exp . '.' . $sig;
+}
+
+function authVerifyToken(string $token): bool
+{
+    if (STORED_PASS_HASH === '') {
+        return false; // script re-uploaded, no valid password
+    }
+    $parts = explode('.', $token, 2);
+    if (count($parts) !== 2) {
+        return false;
+    }
+    [$exp, $sig] = $parts;
+    if ((int)$exp < time()) {
+        return false; // expired
+    }
+    $key      = authSigningKey();
+    $expected = hash_hmac('sha256', $exp . '|' . $key, $key);
+    return hash_equals($expected, $sig);
+}
+
+function authSetCookie(string $keyOverride = ''): void
+{
+    $secure = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+           || ($_SERVER['SERVER_PORT'] ?? 80) == 443;
+    setcookie(AUTH_COOKIE, authMakeToken($keyOverride), [
+        'expires'  => time() + AUTH_TTL,
+        'path'     => '/',
+        'httponly' => true,
+        'samesite' => 'Strict',
+        'secure'   => $secure,
+    ]);
+}
+
+function detectBitrixPresent(): bool
+{
+    return file_exists(__DIR__ . '/bitrix/.settings.php')
+        || file_exists(dirname(__DIR__) . '/bitrix/.settings.php');
+}
+
+/**
+ * Bitrix's own core (main module) version, read from the same file its
+ * "Product Update" admin screen reads: bitrix/modules/main/install/version.php,
+ * which defines $arModuleVersion['VERSION']. Read as plain text and
+ * regex-extracted rather than included, so a tampered file can't execute
+ * arbitrary code in this process.
+ */
+function detectBitrixVersion(string $fwRoot): ?string
+{
+    $file = rtrim($fwRoot, '/') . '/bitrix/modules/main/install/version.php';
+    if (!is_file($file)) {
+        return null;
+    }
+    $content = @file_get_contents($file, false, null, 0, 4096);
+    if ($content === false) {
+        return null;
+    }
+    if (preg_match('/[\'"]VERSION[\'"]\s*=>\s*[\'"]([\d.]+)[\'"]/', $content, $m)) {
+        return $m[1];
+    }
+    return null;
+}
+
+function authClearCookie(): void
+{
+    setcookie(AUTH_COOKIE, '', ['expires' => 1, 'path' => '/', 'httponly' => true, 'samesite' => 'Strict']);
+}
+
 function isAuth(): bool
 {
-    return !empty($_SESSION['ra']);
+    return authVerifyToken($_COOKIE[AUTH_COOKIE] ?? '');
 }
 
 function requireAuth(): void
@@ -124,27 +275,111 @@ function requireAuth(): void
     }
 }
 
+/**
+ * Try to verify $pw against Bitrix superadmin (user ID 1) password hash
+ * fetched from the Bitrix database configured in bitrix/.settings.php.
+ * Handles both modern bcrypt ($2y$) and legacy MD5 hashes.
+ * Returns false silently if Bitrix is not present or DB is unreachable.
+ */
+function verifyBitrixAdminPassword(string $pw): bool
+{
+    // Look for Bitrix config next to this script or one level up
+    $candidates = [
+        __DIR__ . '/bitrix/.settings.php',
+        dirname(__DIR__) . '/bitrix/.settings.php',
+    ];
+    $src = null;
+    foreach ($candidates as $cfg) {
+        $s = @file_get_contents($cfg);
+        if ($s !== false) { $src = $s; break; }
+    }
+    if ($src === null) {
+        return false;
+    }
+
+    // Extract connection params via regex (same approach as extractDbCredentials)
+    $c = [];
+    foreach (['host' => 'host', 'database' => 'db', 'login' => 'user', 'password' => 'pass', 'port' => 'port'] as $k => $out) {
+        if (preg_match('/[\'"]' . $k . '[\'"]\s*=>\s*[\'"]([^\'"]*)[\'"]/', $src, $m) && $m[1] !== '') {
+            $c[$out] = $m[1];
+        }
+    }
+    if (empty($c['host']) || empty($c['db']) || empty($c['user'])) {
+        return false;
+    }
+
+    try {
+        $conn = dbConnect($c['host'], $c['user'], $c['pass'] ?? '', (int)($c['port'] ?? 3306), $c['db']);
+        $row  = $conn->query("SELECT `PASSWORD` FROM `b_user` WHERE `ID` = 1 AND `ACTIVE` = 'Y' LIMIT 1")->fetch_assoc();
+        $stored = $row['PASSWORD'] ?? '';
+        if ($stored === '') {
+            return false;
+        }
+        // Modern Bitrix: bcrypt
+        if (password_verify($pw, $stored)) {
+            return true;
+        }
+        // Legacy Bitrix: plain MD5
+        if (strlen($stored) === 32 && hash_equals($stored, md5($pw))) {
+            return true;
+        }
+    } catch (Throwable $e) {
+        // DB unavailable — fall through
+    }
+    return false;
+}
+
 function handleLogin(): void
 {
     $pw   = trim($_POST['password'] ?? '');
+    $via  = $_POST['via'] ?? 'local'; // 'local' | 'bitrix'
     $hash = STORED_PASS_HASH;
 
     if ($hash === '') {
-        // First run: embed hash into own source
+        // ── First run ────────────────────────────────────────────────────────
+        if ($via === 'bitrix') {
+            // User chose "Login with Bitrix" on the first-run screen
+            if (!verifyBitrixAdminPassword($pw)) {
+                sleep(1);
+                jsonErr('Bitrix admin password not accepted');
+            }
+            // Store a random signing key with a 'bitrix:' marker
+            $key     = bin2hex(random_bytes(32));
+            $written = selfEmbedHash('bitrix:' . $key);
+            authSetCookie($key);
+            jsonOk(['first_run' => true, 'via' => 'bitrix', 'self_written' => $written]);
+        }
+        // Local password setup
         if (strlen($pw) < 6) {
             jsonErr('Password must be at least 6 characters');
         }
         $newHash = password_hash($pw, PASSWORD_BCRYPT);
         $written = selfEmbedHash($newHash);
-        $_SESSION['ra'] = true;
+        authSetCookie($newHash); // constant not updated yet — pass key explicitly
         jsonOk(['first_run' => true, 'self_written' => $written,
                 'warn' => $written ? null : 'Could not write password into script file — make it writable by the web server (chmod 644).']);
     }
 
-    if (password_verify($pw, $hash)) {
-        $_SESSION['ra'] = true;
+    // ── Normal login ─────────────────────────────────────────────────────────
+    $isBitrixMode = str_starts_with($hash, 'bitrix:');
+
+    if (!$isBitrixMode && password_verify($pw, $hash)) {
+        authSetCookie();
         jsonOk(['first_run' => false]);
     }
+
+    if (verifyBitrixAdminPassword($pw)) {
+        authSetCookie();
+        jsonOk(['first_run' => false, 'via' => 'bitrix']);
+    }
+
+    // Bitrix-auth mode but Bitrix is gone — offer emergency local reset
+    if ($isBitrixMode && !detectBitrixPresent()) {
+        sleep(1);
+        jsonErr('Bitrix not found — to reset, delete STORED_PASS_HASH from the script and reload.', 403);
+    }
+
+    sleep(1); // slow brute-force on wrong password
     jsonErr('Invalid password');
 }
 
@@ -174,32 +409,8 @@ function selfEmbedHash(string $hash): bool
 
 function handleLogout(): void
 {
-    session_destroy();
+    authClearCookie();
     jsonOk();
-}
-
-// ── State ────────────────────────────────────────────────────────────────────
-
-function getState(): array
-{
-    if (!file_exists(STATE_FILE)) {
-        return [];
-    }
-    $d = json_decode(file_get_contents(STATE_FILE), true);
-    return is_array($d) ? $d : [];
-}
-
-function saveState(array $s): void
-{
-    file_put_contents(STATE_FILE, json_encode($s, JSON_PRETTY_PRINT));
-}
-
-function handleSetState(): void
-{
-    $in = json_decode(file_get_contents('php://input'), true) ?? [];
-    $s = array_merge(getState(), $in);
-    saveState($s);
-    jsonOk($s);
 }
 
 // ── Upload ────────────────────────────────────────────────────────────────────
@@ -228,23 +439,32 @@ function handleUpload(): void
                 unlink($cp);
             }
             fclose($fp);
-            jsonOk(['file' => $name, 'done' => true]);
+            $verified = verifyFileSha256($dest);
+            jsonOk(['file' => $name, 'done' => true, 'verified' => $verified]);
         }
         jsonOk(['chunk' => $chunk, 'done' => false]);
     }
 
     move_uploaded_file($f['tmp_name'], $dest);
-    jsonOk(['file' => $name, 'size' => filesize($dest), 'done' => true]);
+    $verified = verifyFileSha256($dest);
+    jsonOk(['file' => $name, 'size' => filesize($dest), 'done' => true, 'verified' => $verified]);
 }
 
 function handleListFiles(): void
 {
     $files = [];
     foreach (glob(UPLOADS_DIR . '/*') ?: [] as $f) {
-        if (!is_file($f) || str_contains(basename($f), '.chunk')) {
+        if (!is_file($f) || str_contains(basename($f), '.chunk') || basename($f) === 'index.php') {
             continue;
         }
-        $files[] = ['name' => basename($f), 'size' => filesize($f), 'type' => detectUploadType($f)];
+        $h = readEmbeddedSha256($f);
+        $files[] = [
+            'name'   => basename($f),
+            'size'   => filesize($f),
+            'type'   => detectUploadType($f),
+            'sha256' => $h ? substr($h, 0, 8) . '…' : null,
+            'sha256full' => $h,
+        ];
     }
     jsonOk(['files' => $files]);
 }
@@ -270,6 +490,17 @@ function handleDeleteFile(): void
     jsonOk();
 }
 
+function handleVerifyFile(): void
+{
+    $name = basename($_POST['file'] ?? '');
+    $path = realpath(UPLOADS_DIR . '/' . $name);
+    if (!$path || !str_starts_with($path, realpath(UPLOADS_DIR) . '/')) {
+        jsonErr('Invalid file');
+    }
+    $ok = verifyFileSha256($path);
+    jsonOk(['file' => $name, 'verified' => $ok]);
+}
+
 function detectUploadType(string $path): string
 {
     $n = strtolower(basename($path));
@@ -284,6 +515,142 @@ function detectUploadType(string $path): string
         return 'part';
     }
     return 'unknown';
+}
+
+// ── SHA-256 integrity ─────────────────────────────────────────────────────────
+
+/**
+ * Embed SHA-256 of the current file content at the end.
+ *
+ * ZIP   — hash stored in EOCD comment field; transparent to zip/unzip (shown in file info).
+ * Other — "SHA256:<hex>\n" (72 bytes) appended; tar stops at terminal zero-blocks and never reads it.
+ *
+ * The hash covers content as it exists BEFORE embedding:
+ *   ZIP:   bytes 0..(eocdOffset+19) then two NUL bytes (comment_length=0)
+ *   Other: entire file
+ */
+function embedFileSha256(string $path): string
+{
+    if (strtolower(pathinfo($path, PATHINFO_EXTENSION)) === 'zip') {
+        return embedSha256Zip($path);
+    }
+    $hash = hash_file('sha256', $path);
+    file_put_contents($path, 'SHA256:' . $hash . "\n", FILE_APPEND);
+    return $hash;
+}
+
+/** Read stored SHA-256 without recomputing. Returns null if not embedded. */
+function readEmbeddedSha256(string $path): ?string
+{
+    if (strtolower(pathinfo($path, PATHINFO_EXTENSION)) === 'zip') {
+        return readSha256Zip($path);
+    }
+    $size = filesize($path);
+    if ($size < 72) return null;
+    $fp = fopen($path, 'rb');
+    fseek($fp, $size - 72);
+    $tail = fread($fp, 72);
+    fclose($fp);
+    return preg_match('/^SHA256:([a-f0-9]{64})\n$/', $tail, $m) ? $m[1] : null;
+}
+
+/** Recompute SHA-256 and compare with embedded hash. Returns null if no hash is embedded. */
+function verifyFileSha256(string $path): ?bool
+{
+    if (strtolower(pathinfo($path, PATHINFO_EXTENSION)) === 'zip') {
+        return verifySha256Zip($path);
+    }
+    $size = filesize($path);
+    if ($size < 72) return null;
+    $fp = fopen($path, 'rb');
+    fseek($fp, $size - 72);
+    $tail = fread($fp, 72);
+    fclose($fp);
+    if (!preg_match('/^SHA256:([a-f0-9]{64})\n$/', $tail, $m)) return null;
+    return hash_equals($m[1], streamHashBytes($path, $size - 72));
+}
+
+/** Find EOCD in a ZIP. Returns [absoluteOffset, commentLen] or null. */
+function findZipEocd(string $path): ?array
+{
+    $size = filesize($path);
+    if ($size < 22) return null;
+    $searchLen = min(22 + 65535, $size);
+    $fp = fopen($path, 'rb');
+    fseek($fp, $size - $searchLen);
+    $buf = fread($fp, $searchLen);
+    fclose($fp);
+    for ($i = strlen($buf) - 22; $i >= 0; $i--) {
+        if (substr($buf, $i, 4) !== "\x50\x4b\x05\x06") continue;
+        $cl = unpack('v', substr($buf, $i + 20, 2))[1];
+        if ($i + 22 + $cl === strlen($buf)) {
+            return [($size - $searchLen) + $i, $cl];
+        }
+    }
+    return null;
+}
+
+function embedSha256Zip(string $path): string
+{
+    $eocd = findZipEocd($path);
+    if ($eocd === null) {
+        $hash = hash_file('sha256', $path);
+        file_put_contents($path, 'SHA256:' . $hash . "\n", FILE_APPEND);
+        return $hash;
+    }
+    [$eocdOff] = $eocd;
+    $hash    = streamHashBytes($path, $eocdOff + 20, "\x00\x00");
+    $comment = 'SHA256:' . $hash;
+    $fp      = fopen($path, 'r+b');
+    fseek($fp, $eocdOff + 20);
+    fwrite($fp, pack('v', strlen($comment)) . $comment);
+    ftruncate($fp, $eocdOff + 22 + strlen($comment));
+    fclose($fp);
+    return $hash;
+}
+
+function readSha256Zip(string $path): ?string
+{
+    $eocd = findZipEocd($path);
+    if ($eocd === null || $eocd[1] < 71) return null;
+    [$eocdOff, $cl] = $eocd;
+    $fp = fopen($path, 'rb');
+    fseek($fp, $eocdOff + 22);
+    $comment = fread($fp, $cl);
+    fclose($fp);
+    return preg_match('/^SHA256:([a-f0-9]{64})/', $comment, $m) ? $m[1] : null;
+}
+
+function verifySha256Zip(string $path): ?bool
+{
+    $eocd = findZipEocd($path);
+    if ($eocd === null || $eocd[1] < 71) return null;
+    [$eocdOff, $cl] = $eocd;
+    $fp = fopen($path, 'rb');
+    fseek($fp, $eocdOff + 22);
+    $comment = fread($fp, $cl);
+    fclose($fp);
+    if (!preg_match('/^SHA256:([a-f0-9]{64})/', $comment, $m)) return null;
+    return hash_equals($m[1], streamHashBytes($path, $eocdOff + 20, "\x00\x00"));
+}
+
+/** Stream-hash the first $length bytes of $path, then optionally suffix with $extra. */
+function streamHashBytes(string $path, int $length, string $extra = ''): string
+{
+    $ctx = hash_init('sha256');
+    $fp  = fopen($path, 'rb');
+    $rem = $length;
+    while ($rem > 0) {
+        $buf = fread($fp, min(65536, $rem));
+        if ($buf === false || $buf === '') break;
+        hash_update($ctx, $buf);
+        $rem -= strlen($buf);
+    }
+    fclose($fp);
+    if ($extra !== '') {
+        hash_update($ctx, $extra);
+    }
+    return hash_final($ctx);
 }
 
 // ── Join split parts ─────────────────────────────────────────────────────────
@@ -328,6 +695,7 @@ function handleExtract(): void
 
     rmdirRecursive(EXTRACT_DIR);
     mkdir(EXTRACT_DIR, 0755, true);
+    file_put_contents(EXTRACT_DIR . '/index.php', "<?php http_response_code(403); exit('Forbidden');\n");
 
     $n = strtolower($name);
     if (preg_match('/\.zip$/', $n)) {
@@ -355,6 +723,43 @@ function extractZip(string $src, string $dst): array
         if ($z->open($src) !== true) {
             return ['ok' => false, 'err' => 'Cannot open ZIP'];
         }
+        // Detect if the archive uses OEM/CP866 encoding (Windows Cyrillic ZIPs).
+        // If any entry name is not valid UTF-8, convert from CP866 manually.
+        $needsConv = false;
+        for ($i = 0; $i < $z->numFiles; $i++) {
+            if (!mb_check_encoding($z->getNameIndex($i), 'UTF-8')) {
+                $needsConv = true;
+                break;
+            }
+        }
+        if ($needsConv) {
+            $realDst = realpath($dst);
+            for ($i = 0; $i < $z->numFiles; $i++) {
+                $raw  = $z->getNameIndex($i, ZipArchive::FL_ENC_RAW);
+                $name = mb_convert_encoding($raw, 'UTF-8', 'CP866');
+                if (!mb_check_encoding($name, 'UTF-8')) {
+                    $name = mb_convert_encoding($raw, 'UTF-8', 'CP1251');
+                }
+                // Resolve path traversal sequences without filesystem calls
+                $segments = [];
+                foreach (explode('/', str_replace('\\', '/', $name)) as $seg) {
+                    if ($seg === '' || $seg === '.') continue;
+                    if ($seg === '..') { array_pop($segments); continue; }
+                    $segments[] = $seg;
+                }
+                $out = $realDst . '/' . implode('/', $segments);
+                // Must remain within $dst
+                if (!str_starts_with($out, $realDst . '/')) continue;
+                if (str_ends_with($name, '/')) {
+                    @mkdir($out, 0755, true);
+                } else {
+                    @mkdir(dirname($out), 0755, true);
+                    file_put_contents($out, $z->getFromIndex($i));
+                }
+            }
+            $z->close();
+            return ['ok' => true];
+        }
         $z->extractTo($dst);
         $z->close();
         return ['ok' => true];
@@ -365,36 +770,81 @@ function extractZip(string $src, string $dst): array
 
 function extractTarGz(string $src, string $dst): array
 {
-    exec('tar -xzf ' . escapeshellarg($src) . ' -C ' . escapeshellarg($dst) . ' 2>&1', $o, $c);
-    if ($c === 0) {
-        return ['ok' => true];
-    }
-    // Try PharData
+    // Prefer PHP native — no dependency on tar binary
     try {
         (new PharData($src))->extractTo($dst, null, true);
         return ['ok' => true];
     } catch (Throwable $e) {
+        $pharErr = $e->getMessage();
     }
-    return ['ok' => false, 'err' => implode("\n", $o)];
+    // PharData can fail on archives with appended trailing bytes (e.g. our SHA-256 tag).
+    // Strip the tag to a temp file and retry before falling back to shell.
+    if (readEmbeddedSha256($src) !== null) {
+        $tmp = $src . '.notag.tmp';
+        if (streamCopyBytes($src, $tmp, filesize($src) - 72)) {
+            try {
+                (new PharData($tmp))->extractTo($dst, null, true);
+                unlink($tmp);
+                return ['ok' => true];
+            } catch (Throwable $e2) {
+                $pharErr = $e2->getMessage();
+            }
+            unlink($tmp);
+        }
+    }
+    exec('tar -xzf ' . escapeshellarg($src) . ' -C ' . escapeshellarg($dst) . ' 2>&1', $o, $c);
+    return $c === 0 ? ['ok' => true] : ['ok' => false, 'err' => $pharErr . ' | ' . implode("\n", $o)];
 }
 
 function extractTar(string $src, string $dst): array
 {
-    exec('tar -xf ' . escapeshellarg($src) . ' -C ' . escapeshellarg($dst) . ' 2>&1', $o, $c);
-    if ($c === 0) {
-        return ['ok' => true];
-    }
     try {
         (new PharData($src))->extractTo($dst, null, true);
         return ['ok' => true];
     } catch (Throwable $e) {
+        $pharErr = $e->getMessage();
     }
-    return ['ok' => false, 'err' => implode("\n", $o)];
+    if (readEmbeddedSha256($src) !== null) {
+        $tmp = $src . '.notag.tmp';
+        if (streamCopyBytes($src, $tmp, filesize($src) - 72)) {
+            try {
+                (new PharData($tmp))->extractTo($dst, null, true);
+                unlink($tmp);
+                return ['ok' => true];
+            } catch (Throwable $e2) {
+                $pharErr = $e2->getMessage();
+            }
+            unlink($tmp);
+        }
+    }
+    exec('tar -xf ' . escapeshellarg($src) . ' -C ' . escapeshellarg($dst) . ' 2>&1', $o, $c);
+    return $c === 0 ? ['ok' => true] : ['ok' => false, 'err' => $pharErr . ' | ' . implode("\n", $o)];
+}
+
+/** Copy exactly $length bytes from $src to $dst. Returns true on success. */
+function streamCopyBytes(string $src, string $dst, int $length): bool
+{
+    $in  = fopen($src, 'rb');
+    $out = fopen($dst, 'wb');
+    if (!$in || !$out) {
+        return false;
+    }
+    $rem = $length;
+    while ($rem > 0) {
+        $buf = fread($in, min(65536, $rem));
+        if ($buf === false || $buf === '') break;
+        fwrite($out, $buf);
+        $rem -= strlen($buf);
+    }
+    fclose($in);
+    fclose($out);
+    return $rem === 0;
 }
 
 function singleNestedDir(string $dir): ?string
 {
-    $entries = array_values(array_diff(scandir($dir), ['.', '..']));
+    // Exclude our own directory-listing/access guards, not part of the actual content
+    $entries = array_values(array_diff(scandir($dir), ['.', '..', 'index.php', '.htaccess']));
     if (count($entries) === 1 && is_dir($dir . '/' . $entries[0])) {
         return $entries[0];
     }
@@ -407,17 +857,138 @@ function handleScan(): void
 {
     $nested = singleNestedDir(EXTRACT_DIR);
     $root   = $nested ? EXTRACT_DIR . '/' . $nested : EXTRACT_DIR;
-    $fw     = detectFramework($root);
-    $sqls   = findSqlFiles(EXTRACT_DIR);
-    jsonOk(['root' => $root, 'nested' => $nested, 'framework' => $fw, 'sqls' => $sqls, 'files' => countFiles($root)]);
+
+    // Auto-extract any inner archives (e.g. outer zip contains site.zip + dump.sql)
+    extractInnerArchives($root);
+
+    $fw      = detectFramework($root);
+    $fwRoot  = findFrameworkRoot($root);
+    $sqls    = findSqlFiles(EXTRACT_DIR);
+    // Fall back to SQL-based detection when the extract dir has no framework files
+    if ($fw === 'unknown' && !empty($sqls)) {
+        $fw = detectFrameworkFromSql($sqls[0]['path']);
+    }
+
+    $liveSite = false;
+    // Nothing extracted yet — this script may be sitting inside a live site
+    // (e.g. dropped in for emergency access/repair). Detect that instead.
+    if ($fw === 'unknown' && countFiles($root) === 0) {
+        $liveFw = detectFramework(__DIR__);
+        if ($liveFw !== 'unknown') {
+            $fw       = $liveFw;
+            $fwRoot   = findFrameworkRoot(__DIR__);
+            $root     = __DIR__;
+            $liveSite = true;
+        }
+    }
+
+    $dbCreds = extractDbCredentials($fwRoot, $fw);
+    $siteUrl = extractSiteUrl($fwRoot, $fw);
+    $prefix  = extractTablePrefix($fwRoot, $fw);
+    $bitrixSites   = $fw === 'bitrix' ? detectBitrixSites($dbCreds) : [];
+    $bitrixDevMode = $fw === 'bitrix' ? getBitrixDevMode($dbCreds) : null;
+    $bitrixDomain  = $fw === 'bitrix' ? detectBitrixDomainMismatch($dbCreds) : null;
+    $bitrixVersion = $fw === 'bitrix' ? detectBitrixVersion($fwRoot) : null;
+    // matched_by is 'domain' or 'fallback' at this point (set inside
+    // detectBitrixSites()) — the browser overrides this client-side with a
+    // 'kernel'-verified result via its own fetch() to bitrix_site_id_internal,
+    // since that self-request must happen from the browser, not server-side
+    // (see handleBitrixSiteIdInternal()'s doc comment for why).
+
+    jsonOk([
+        'root'              => $root,
+        'nested'            => $nested,
+        'framework'         => $fw,
+        'sqls'              => $sqls,
+        'files'             => countFiles($root),
+        'db_credentials'    => $dbCreds,
+        'live_site'         => $liveSite,
+        'site_url'          => $siteUrl,
+        'table_prefix'      => $prefix,
+        'server_env'        => getServerEnvironment(),
+        'disk_free'         => @disk_free_space(WORK_DIR),
+        'backups'           => listBackups(),
+        'bitrix_available'  => detectBitrixPresent(),
+        'bitrix_sites'      => $bitrixSites,
+        'bitrix_dev_mode'   => $bitrixDevMode,
+        'bitrix_domain_check' => $bitrixDomain,
+        'bitrix_version'    => $bitrixVersion,
+        'current_host'      => $fw === 'bitrix' ? currentRequestHost() : null,
+    ]);
+}
+
+/**
+ * Extract any archive files found directly inside $dir (one level deep).
+ * Archives are extracted in-place: archive.zip → archive.zip_extracted/
+ * Already-extracted directories are skipped.
+ */
+function extractInnerArchives(string $dir): void
+{
+    if (!is_dir($dir)) {
+        return;
+    }
+    foreach (scandir($dir) as $entry) {
+        if ($entry === '.' || $entry === '..') {
+            continue;
+        }
+        $path = $dir . '/' . $entry;
+        if (!is_file($path)) {
+            continue;
+        }
+        $lo  = strtolower($entry);
+        $dst = $path . '_extracted';
+        if (is_dir($dst)) {
+            continue; // already done
+        }
+        if (preg_match('/\.zip$/', $lo)) {
+            mkdir($dst, 0755, true);
+            $r = extractZip($path, $dst);
+        } elseif (preg_match('/\.(tar\.gz|tgz)$/', $lo)) {
+            mkdir($dst, 0755, true);
+            $r = extractTarGz($path, $dst);
+        } elseif (preg_match('/\.tar$/', $lo)) {
+            mkdir($dst, 0755, true);
+            $r = extractTar($path, $dst);
+        } else {
+            continue;
+        }
+        if (!($r['ok'] ?? false)) {
+            @rmdir($dst); // clean up empty dir on failure
+        }
+    }
 }
 
 // ── Framework detection ───────────────────────────────────────────────────────
 
 function detectFramework(string $dir): string
 {
+    $fw = detectFrameworkDir($dir);
+    if ($fw !== 'unknown') {
+        return $fw;
+    }
+    // Also look inside *_extracted sub-directories (inner archives auto-extracted by scan)
+    foreach (glob($dir . '/*_extracted', GLOB_ONLYDIR) as $sub) {
+        $nested = singleNestedDir($sub);
+        $root   = $nested ? $sub . '/' . $nested : $sub;
+        $fw     = detectFrameworkDir($root);
+        if ($fw !== 'unknown') {
+            return $fw;
+        }
+    }
+    return 'unknown';
+}
+
+function detectFrameworkDir(string $dir): string
+{
+    // Config files are more reliable than directory names alone
+    if (file_exists($dir . '/bitrix/.settings.php') || file_exists($dir . '/bitrix/php_interface/dbconn.php')) {
+        return 'bitrix';
+    }
     if (is_dir($dir . '/bitrix') && file_exists($dir . '/bitrix/modules/main/include.php')) {
         return 'bitrix';
+    }
+    if (file_exists($dir . '/wa-config/db.php') || file_exists($dir . '/wa-config/SystemConfig.class.php')) {
+        return 'webasyst';
     }
     if (file_exists($dir . '/wp-config.php') || file_exists($dir . '/wp-includes/version.php')) {
         return 'wordpress';
@@ -428,7 +999,526 @@ function detectFramework(string $dir): string
     if (is_dir($dir . '/wa-system') || (is_dir($dir . '/wa-apps') && is_dir($dir . '/wa-config'))) {
         return 'webasyst';
     }
+    if (file_exists($dir . '/setup.php') && file_exists($dir . '/includes/db.php') && file_exists($dir . '/includes/settings.php')) {
+        return 'fslcms';
+    }
     return 'unknown';
+}
+
+/**
+ * Return the specific directory within $dir (or an _extracted sub) where the
+ * framework files were found — used to locate config files for credential extraction.
+ */
+function findFrameworkRoot(string $dir): string
+{
+    if (detectFrameworkDir($dir) !== 'unknown') {
+        return $dir;
+    }
+    foreach (glob($dir . '/*_extracted', GLOB_ONLYDIR) ?: [] as $sub) {
+        $nested = singleNestedDir($sub);
+        $root   = $nested ? $sub . '/' . $nested : $sub;
+        if (detectFrameworkDir($root) !== 'unknown') {
+            return $root;
+        }
+    }
+    return $dir;
+}
+
+/**
+ * Parse framework config files and return DB connection parameters.
+ * Returns keys: db_host, db_port, db_user, db_pass, db_name (all strings, port is int-as-string).
+ */
+function extractDbCredentials(string $dir, string $fw): array
+{
+    $c = [];
+    switch ($fw) {
+        case 'wordpress':
+            $src = @file_get_contents($dir . '/wp-config.php');
+            if (!$src) break;
+            $map = ['DB_NAME' => 'db_name', 'DB_USER' => 'db_user', 'DB_PASSWORD' => 'db_pass', 'DB_HOST' => 'db_host'];
+            foreach ($map as $const => $key) {
+                if (preg_match('/define\s*\(\s*[\'"]' . $const . '[\'"]\s*,\s*[\'"]([^\'"]*)[\'"]/', $src, $m)) {
+                    $c[$key] = $m[1];
+                }
+            }
+            // DB_HOST may be "host:port"
+            if (!empty($c['db_host']) && str_contains($c['db_host'], ':')) {
+                [$h, $p] = explode(':', $c['db_host'], 2);
+                $c['db_host'] = $h;
+                if (is_numeric($p)) $c['db_port'] = (int)$p;
+            }
+            break;
+
+        case 'bitrix':
+            $src = @file_get_contents($dir . '/bitrix/.settings.php');
+            if ($src) {
+                // Newer format: 'host', 'database', 'login', 'password' inside connections.value.default
+                $kmap = ['host' => 'db_host', 'database' => 'db_name', 'login' => 'db_user', 'password' => 'db_pass', 'port' => 'db_port'];
+                foreach ($kmap as $k => $out) {
+                    if (preg_match('/[\'"]' . $k . '[\'"]\s*=>\s*[\'"]([^\'"]*)[\'"]/', $src, $m) && $m[1] !== '') {
+                        $c[$out] = ($out === 'db_port') ? (int)$m[1] : $m[1];
+                    }
+                }
+            }
+            if (empty($c)) {
+                // Older format: $DBLogin, $DBPassword, $DBName, $DBHost in dbconn.php
+                $src = @file_get_contents($dir . '/bitrix/php_interface/dbconn.php');
+                if ($src) {
+                    $kmap = ['DBName' => 'db_name', 'DBLogin' => 'db_user', 'DBPassword' => 'db_pass', 'DBHost' => 'db_host'];
+                    foreach ($kmap as $k => $out) {
+                        if (preg_match('/\$' . $k . '\s*=\s*["\']([^"\']*)["\']/', $src, $m)) {
+                            $c[$out] = $m[1];
+                        }
+                    }
+                }
+            }
+            break;
+
+        case 'webasyst':
+            $src = @file_get_contents($dir . '/wa-config/db.php');
+            if ($src) {
+                $kmap = ['host' => 'db_host', 'user' => 'db_user', 'password' => 'db_pass', 'name' => 'db_name', 'port' => 'db_port'];
+                foreach ($kmap as $k => $out) {
+                    if (preg_match('/[\'"]' . $k . '[\'"]\s*=>\s*[\'"]([^\'"]*)[\'"]/', $src, $m) && $m[1] !== '') {
+                        $c[$out] = ($out === 'db_port') ? (int)$m[1] : $m[1];
+                    }
+                }
+            }
+            break;
+
+        case 'modx':
+            foreach ([$dir . '/core/config/config.inc.php', $dir . '/manager/includes/config.inc.php'] as $cfg) {
+                $src = @file_get_contents($cfg);
+                if (!$src) continue;
+                $kmap = ['database_server' => 'db_host', 'dbase' => 'db_name', 'database_user' => 'db_user', 'database_password' => 'db_pass'];
+                foreach ($kmap as $k => $out) {
+                    if (preg_match('/\$' . $k . '\s*=\s*["\']([^"\']*)["\']/', $src, $m)) {
+                        $c[$out] = $m[1];
+                    }
+                }
+                break;
+            }
+            break;
+
+        case 'fslcms':
+            $src = @file_get_contents($dir . '/setup.php');
+            if (!$src) break;
+            $map = ['DBHOST' => 'db_host', 'DBLOGIN' => 'db_user', 'DBPASSWORD' => 'db_pass', 'DBNAME' => 'db_name'];
+            foreach ($map as $const => $key) {
+                if (preg_match('/define\s*\(\s*[\'"]' . $const . '[\'"]\s*,\s*[\'"]([^\'"]*)[\'"]/', $src, $m)) {
+                    $c[$key] = $m[1];
+                }
+            }
+            break;
+    }
+    return $c;
+}
+
+/** Parse the site's base URL from its config file, where available. */
+function extractSiteUrl(string $dir, string $fw): ?string
+{
+    switch ($fw) {
+        case 'wordpress':
+            $src = @file_get_contents($dir . '/wp-config.php');
+            if ($src && preg_match('/define\s*\(\s*[\'"]WP_HOME[\'"]\s*,\s*[\'"]([^\'"]*)[\'"]/', $src, $m)) {
+                return rtrim($m[1], '/');
+            }
+            if ($src && preg_match('/define\s*\(\s*[\'"]WP_SITEURL[\'"]\s*,\s*[\'"]([^\'"]*)[\'"]/', $src, $m)) {
+                return rtrim($m[1], '/');
+            }
+            return null;
+        case 'webasyst':
+            $src = @file_get_contents($dir . '/wa-config/config.php');
+            if ($src && preg_match('/[\'"]url[\'"]\s*=>\s*[\'"]([^\'"]*)[\'"]/', $src, $m)) {
+                return rtrim($m[1], '/');
+            }
+            return null;
+        case 'modx':
+            foreach ([$dir . '/core/config/config.inc.php', $dir . '/manager/includes/config.inc.php'] as $cfg) {
+                $src = @file_get_contents($cfg);
+                if ($src && preg_match('/\$site_url\s*=\s*[\'"]([^\'"]*)[\'"]/', $src, $m)) {
+                    return rtrim($m[1], '/');
+                }
+            }
+            return null;
+        case 'fslcms':
+            // FSLCMS derives its base URL from $_SERVER['SERVER_NAME'] at request time — never stored in config.
+            return null;
+        default:
+            // Bitrix stores the site URL in the b_lang/b_option DB tables, not a config file.
+            return null;
+    }
+}
+
+/** Return the table prefix for the detected framework, where it's configurable. */
+function extractTablePrefix(string $dir, string $fw): ?string
+{
+    switch ($fw) {
+        case 'wordpress':
+            $src = @file_get_contents($dir . '/wp-config.php');
+            if ($src && preg_match('/\$table_prefix\s*=\s*[\'"]([^\'"]*)[\'"]/', $src, $m)) {
+                return $m[1];
+            }
+            return 'wp_';
+        case 'bitrix':
+            return 'b_';
+        case 'webasyst':
+            return 'wa_';
+        default:
+            return null;
+    }
+}
+
+/** PHP/server environment relevant to restore operations. */
+/** True if $name is a real, callable function — not just loaded, but not blocked by disable_functions either. */
+function phpFunctionAvailable(string $name): bool
+{
+    static $disabled = null;
+    if ($disabled === null) {
+        $disabled = array_map('trim', explode(',', (string)ini_get('disable_functions')));
+    }
+    return function_exists($name) && !in_array($name, $disabled, true);
+}
+
+function getServerEnvironment(): array
+{
+    $bin = fn(string $cmd) => trim(shell_exec("which {$cmd} 2>/dev/null") ?: '') !== '';
+    $sw  = (string)($_SERVER['SERVER_SOFTWARE'] ?? '');
+    return [
+        'php_version'     => PHP_VERSION,
+        'server_software' => $sw ?: 'unknown',
+        // .htaccess-based protection of WORK_DIR only works under Apache —
+        // nginx ignores .htaccess entirely and needs an explicit config rule.
+        'is_nginx'        => str_contains(strtolower($sw), 'nginx'),
+        'extensions'  => [
+            'mysqli'    => extension_loaded('mysqli'),
+            'zip'       => extension_loaded('zip'),
+            'mbstring'  => extension_loaded('mbstring'),
+            'phar'      => extension_loaded('phar'),
+        ],
+        // exec()/shell_exec() etc. back the tar/mysqldump/mysql CLI paths —
+        // hosts often disable these via php.ini's disable_functions, in which
+        // case only the PharData/mysqli fallbacks work.
+        'functions' => [
+            'exec'       => phpFunctionAvailable('exec'),
+            'shell_exec' => phpFunctionAvailable('shell_exec'),
+            'system'     => phpFunctionAvailable('system'),
+            'passthru'   => phpFunctionAvailable('passthru'),
+            'proc_open'  => phpFunctionAvailable('proc_open'),
+            'popen'      => phpFunctionAvailable('popen'),
+        ],
+        'tools' => [
+            'tar'      => $bin('tar'),
+            'unzip'    => $bin('unzip'),
+            'mysql'    => $bin('mysql'),
+            'mysqldump'=> $bin('mysqldump'),
+        ],
+    ];
+}
+
+/**
+ * Bitrix supports multiple sites (domains) sharing one codebase/DB, defined
+ * in the b_lang table with a DOC_ROOT per site. When a site's DOC_ROOT
+ * differs from this script's directory, that's a separate file tree that a
+ * plain backup of __DIR__ would NOT capture — surfaced so the user knows to
+ * back it up too.
+ */
+/**
+ * Normalize a hostname for comparison: strip a port suffix (HTTP_HOST
+ * includes it for non-default ports) and a leading "www." (an extremely
+ * common real-world mismatch — site bound without www but reached with it,
+ * or vice versa).
+ */
+function normalizeHost(string $h): string
+{
+    return preg_replace('/^www\./', '', strtolower(explode(':', $h)[0]));
+}
+
+/** The domain this request actually arrived on, normalized for comparison. */
+function currentRequestHost(): string
+{
+    return normalizeHost($_SERVER['HTTP_HOST'] ?? '');
+}
+
+function detectBitrixSites(array $dbCreds): array
+{
+    if (empty($dbCreds['db_host']) || empty($dbCreds['db_name'])) {
+        return [];
+    }
+    try {
+        $conn = dbConnect(
+            $dbCreds['db_host'],
+            $dbCreds['db_user'] ?? '',
+            $dbCreds['db_pass'] ?? '',
+            (int)($dbCreds['db_port'] ?? 3306),
+            $dbCreds['db_name']
+        );
+        // b_lang has a real DEF column ('Y'/'N') — Bitrix's own explicit
+        // "this is the default site" flag, maintained by its admin UI
+        // (Настройки → Сайты → Список сайтов → По умолчанию). No need to
+        // infer a fallback via SORT order; just read what Bitrix itself
+        // already recorded.
+        $rows = $conn->query("SELECT LID, SERVER_NAME, DOC_ROOT, ACTIVE, DEF FROM b_lang ORDER BY DEF DESC, LID ASC")->fetch_all(MYSQLI_ASSOC);
+        $currentHost = currentRequestHost();
+
+        $sites = array_map(function ($r) use ($currentHost) {
+            $docRoot = (string)$r['DOC_ROOT'];
+            $active  = $r['ACTIVE'] === 'Y';
+            return [
+                'site_id'          => $r['LID'],
+                'domain'           => $r['SERVER_NAME'],
+                'doc_root'         => $docRoot,
+                'active'           => $active,
+                'is_default_flag'  => $r['DEF'] === 'Y',
+                'domain_matches'   => $active && $r['SERVER_NAME'] !== '' && normalizeHost($r['SERVER_NAME']) === $currentHost,
+                'external_root'    => $docRoot !== '' && rtrim($docRoot, '/') !== rtrim(__DIR__, '/'),
+            ];
+        }, $rows ?: []);
+
+        // Prefer a genuine domain match; otherwise fall back to whichever
+        // site has DEF='Y' — Bitrix's own recorded default, not a guess. If
+        // somehow no site has DEF='Y' either (shouldn't normally happen),
+        // fall back further to the first site overall so DEFAULT always
+        // points at *some* row rather than showing no badge at all.
+        $matchIdx = null;
+        foreach ($sites as $i => $s) {
+            if ($s['domain_matches']) { $matchIdx = $i; break; }
+        }
+        $matchedByDomain = $matchIdx !== null;
+        if ($matchIdx === null) {
+            foreach ($sites as $i => $s) {
+                if ($s['is_default_flag']) { $matchIdx = $i; break; }
+            }
+        }
+        if ($matchIdx === null && !empty($sites)) {
+            $matchIdx = 0;
+        }
+
+        // is_default reflects b_lang's real DEF flag — a static fact about
+        // this site, shown regardless of whether it also happens to be the
+        // currently-matched one (unlike matched_by:'fallback', which only
+        // applies when no domain matched at all).
+        foreach ($sites as $i => &$s) {
+            $s['is_current']    = $i === $matchIdx;
+            $s['matched_by']    = $i === $matchIdx ? ($matchedByDomain ? 'domain' : 'fallback') : null;
+            $s['is_default']    = $s['is_default_flag'];
+            unset($s['domain_matches'], $s['is_default_flag']);
+        }
+        unset($s);
+        return $sites;
+    } catch (Throwable $e) {
+        return [];
+    }
+}
+
+/**
+ * Read Bitrix's "Installation for development" flag (Main module, admin UI
+ * field name opt_update_devsrv → b_option MODULE_ID='main',
+ * NAME='update_devsrv'). Per Bitrix's own documentation this is tracked by
+ * their license servers and is meant for shared dev/staging installs — not
+ * for silencing the separate domain-license-mismatch warning, which is an
+ * account-portal mechanism, not a local DB flag. Returns null if unreadable
+ * or unset.
+ */
+function getBitrixDevMode(array $dbCreds): ?string
+{
+    if (empty($dbCreds['db_host']) || empty($dbCreds['db_name'])) {
+        return null;
+    }
+    try {
+        $conn = dbConnect(
+            $dbCreds['db_host'],
+            $dbCreds['db_user'] ?? '',
+            $dbCreds['db_pass'] ?? '',
+            (int)($dbCreds['db_port'] ?? 3306),
+            $dbCreds['db_name']
+        );
+        $row = $conn->query("SELECT VALUE FROM b_option WHERE MODULE_ID = 'main' AND NAME = 'update_devsrv' LIMIT 1")->fetch_row();
+        return $row === null ? null : (string)$row[0];
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+/**
+ * Compare main.server_name (Main module, b_option) against the domain this
+ * very request actually arrived on. Confirmed directly via a live Set-Cookie
+ * header: Bitrix sets the session cookie's Domain attribute from this value,
+ * and browsers reject the cookie outright when it doesn't match the site
+ * actually being visited — nobody stays logged in until it's fixed. Also
+ * used to build absolute URLs outside of a request context (cron agents,
+ * notifications, RSS/sitemaps). A stored config value can go stale (e.g.
+ * after moving a site prod->dev or back), but the current request's Host
+ * header cannot: it's what's really being used right now. main.site_name
+ * is shown for reference only; it's not compared here (unconfirmed whether
+ * it's even meant to hold a domain — see main.server_name's own field).
+ */
+function detectBitrixDomainMismatch(array $dbCreds): ?array
+{
+    if (empty($dbCreds['db_host']) || empty($dbCreds['db_name'])) {
+        return null;
+    }
+    try {
+        $conn = dbConnect(
+            $dbCreds['db_host'],
+            $dbCreds['db_user'] ?? '',
+            $dbCreds['db_pass'] ?? '',
+            (int)($dbCreds['db_port'] ?? 3306),
+            $dbCreds['db_name']
+        );
+        $opts = ['server_name' => null, 'site_name' => null];
+        $res  = $conn->query("SELECT NAME, VALUE FROM b_option WHERE MODULE_ID = 'main' AND NAME IN ('server_name', 'site_name')");
+        while ($row = $res->fetch_assoc()) {
+            $opts[$row['NAME']] = $row['VALUE'];
+        }
+
+        $currentHost = currentRequestHost();
+
+        return [
+            'server_name'  => $opts['server_name'],
+            'site_name'    => $opts['site_name'],
+            'current_host' => $currentHost,
+            'mismatch'     => $opts['server_name'] !== null && $currentHost !== '' && normalizeHost($opts['server_name']) !== $currentHost,
+        ];
+    } catch (Throwable $e) {
+        return null;
+    }
+}
+
+function handleBitrixFixDomain(): void
+{
+    $root = requireSiteDir($_POST['dir'] ?? '');
+    if (detectFramework($root) !== 'bitrix') {
+        jsonErr('Not a Bitrix installation');
+    }
+    $fwRoot  = findFrameworkRoot($root);
+    $dbCreds = extractDbCredentials($fwRoot, 'bitrix');
+    if (empty($dbCreds['db_host']) || empty($dbCreds['db_name'])) {
+        jsonErr('Could not resolve Bitrix DB credentials');
+    }
+    $target = currentRequestHost();
+    if ($target === '') {
+        jsonErr('Could not determine the current request host');
+    }
+    try {
+        $conn = dbConnect($dbCreds['db_host'], $dbCreds['db_user'] ?? '', $dbCreds['db_pass'] ?? '', (int)($dbCreds['db_port'] ?? 3306), $dbCreds['db_name']);
+
+        $stmt = $conn->prepare("UPDATE b_option SET VALUE = ? WHERE MODULE_ID = 'main' AND NAME = 'server_name'");
+        $stmt->bind_param('s', $target);
+        $stmt->execute();
+        if ($conn->affected_rows === 0) {
+            $ins = $conn->prepare("INSERT INTO b_option (MODULE_ID, NAME, VALUE) VALUES ('main', 'server_name', ?)");
+            $ins->bind_param('s', $target);
+            $ins->execute();
+        }
+        jsonOk(['domain' => $target]);
+    } catch (Throwable $e) {
+        jsonErr('DB error: ' . $e->getMessage());
+    }
+}
+
+function handleBitrixToggleDevMode(): void
+{
+    $root = requireSiteDir($_POST['dir'] ?? '');
+    if (detectFramework($root) !== 'bitrix') {
+        jsonErr('Not a Bitrix installation');
+    }
+    $fwRoot  = findFrameworkRoot($root);
+    $dbCreds = extractDbCredentials($fwRoot, 'bitrix');
+    if (empty($dbCreds['db_host']) || empty($dbCreds['db_name'])) {
+        jsonErr('Could not resolve Bitrix DB credentials');
+    }
+    try {
+        $conn = dbConnect($dbCreds['db_host'], $dbCreds['db_user'] ?? '', $dbCreds['db_pass'] ?? '', (int)($dbCreds['db_port'] ?? 3306), $dbCreds['db_name']);
+        $row  = $conn->query("SELECT VALUE FROM b_option WHERE MODULE_ID = 'main' AND NAME = 'update_devsrv' LIMIT 1")->fetch_row();
+        $old  = $row === null ? null : $row[0];
+        $new  = ($old === 'Y') ? 'N' : 'Y';
+        if ($old === null) {
+            $stmt = $conn->prepare("INSERT INTO b_option (MODULE_ID, NAME, VALUE) VALUES ('main', 'update_devsrv', ?)");
+        } else {
+            $stmt = $conn->prepare("UPDATE b_option SET VALUE = ? WHERE MODULE_ID = 'main' AND NAME = 'update_devsrv'");
+        }
+        $stmt->bind_param('s', $new);
+        $stmt->execute();
+        jsonOk(['old' => $old, 'new' => $new]);
+    } catch (Throwable $e) {
+        jsonErr('DB error: ' . $e->getMessage());
+    }
+}
+
+/**
+ * List backups in BACKUPS_DIR, grouping split multi-part archives
+ * (backup_TS.tar.gz.aa/.ab/... or Bitrix-style .001/.002/...) and their
+ * matching .sql dump into one logical entry per timestamp.
+ */
+function listBackups(): array
+{
+    $groups = [];
+    foreach (glob(BACKUPS_DIR . '/backup_*') ?: [] as $f) {
+        if (!is_file($f)) {
+            continue;
+        }
+        $name = basename($f);
+        if (!preg_match('/^backup_(\d{8}_\d{6})/', $name, $m)) {
+            continue;
+        }
+        $ts = $m[1];
+        $groups[$ts]['files'][] = ['name' => $name, 'size' => filesize($f)];
+        $groups[$ts]['total']    = ($groups[$ts]['total'] ?? 0) + filesize($f);
+        $groups[$ts]['mtime']    = max($groups[$ts]['mtime'] ?? 0, filemtime($f));
+    }
+    $out = [];
+    foreach ($groups as $ts => $g) {
+        usort($g['files'], fn($a, $b) => strcmp($a['name'], $b['name']));
+        $out[] = [
+            'timestamp' => $ts,
+            'files'     => $g['files'],
+            'part_count'=> count($g['files']),
+            'total_size'=> $g['total'],
+            'mtime'     => $g['mtime'],
+        ];
+    }
+    usort($out, fn($a, $b) => $b['mtime'] <=> $a['mtime']);
+    return $out;
+}
+
+function detectFrameworkFromSql(string $path): string
+{
+    // Read up to 512 KB — enough to see the first several CREATE TABLE statements
+    // without loading a 150 MB dump into memory.
+    $gz = str_ends_with(strtolower($path), '.gz');
+    $h  = '';
+    if ($gz) {
+        $g = @gzopen($path, 'r');
+        if ($g) { $h = gzread($g, 524288); gzclose($g); }
+    } else {
+        $fp = @fopen($path, 'r');
+        if ($fp) { $h = fread($fp, 524288); fclose($fp); }
+    }
+
+    // Score each framework by counting distinct matching table names found.
+    $scores = ['bitrix' => 0, 'wordpress' => 0, 'modx' => 0, 'webasyst' => 0];
+
+    preg_match_all('/CREATE TABLE `([^`]+)`/i', $h, $m);
+    foreach ($m[1] as $tbl) {
+        if (preg_match('/^b_(user|option|iblock|agent|event|file|group|lang|module|task|vote)$/', $tbl)) {
+            $scores['bitrix'] += 10;
+        } elseif (preg_match('/^wa_[a-z]/', $tbl)) {
+            $scores['webasyst'] += 5;
+        } elseif (preg_match('/^(modx_users|modx_site_content|modx_site_templates|modx_web_groups)$/', $tbl)) {
+            $scores['modx'] += 10;
+        } elseif (preg_match('/^\w*wp_(options|posts|users|usermeta|terms|postmeta|comments)$/', $tbl)) {
+            $scores['wordpress'] += 10;
+        }
+        // Penalise WP plugin tables (wp_*_something) — present on Webasyst+WP hybrid sites
+        if (preg_match('/^wp_\d+_/', $tbl)) {
+            $scores['wordpress'] -= 3;
+        }
+    }
+
+    arsort($scores);
+    $top = key($scores);
+    return $scores[$top] > 0 ? $top : 'unknown';
 }
 
 // ── SQL heuristics ────────────────────────────────────────────────────────────
@@ -436,7 +1526,15 @@ function detectFramework(string $dir): string
 function findSqlFiles(string $base): array
 {
     $files = [];
-    $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($base, FilesystemIterator::SKIP_DOTS));
+    $skipDirs = ['vendor', 'tests', 'test', 'fixtures', 'expected', 'node_modules'];
+    $dirIter  = new RecursiveDirectoryIterator($base, FilesystemIterator::SKIP_DOTS);
+    $filtered = new RecursiveCallbackFilterIterator($dirIter, function ($f) use ($skipDirs) {
+        if ($f->isDir()) {
+            return !in_array(strtolower($f->getFilename()), $skipDirs, true);
+        }
+        return true;
+    });
+    $it = new RecursiveIteratorIterator($filtered);
     foreach ($it as $f) {
         if (!$f->isFile()) {
             continue;
@@ -517,24 +1615,90 @@ function sqlScore(string $path, string $name): int
 
 // ── Database ──────────────────────────────────────────────────────────────────
 
-function dbConnect(string $host, string $user, string $pass, int $port, string $db = ''): PDO
+/**
+ * Native mysqli connection — Bitrix's own DB layer (CDatabase) uses mysqli
+ * directly, not PDO, so hosts with mysqli but no pdo_mysql are common and
+ * otherwise fully functional for Bitrix itself. Exception-mode reporting is
+ * enabled so query()/prepare()/execute() throw on failure, matching every
+ * existing try/catch(Throwable) call site without further changes there.
+ * mysqli::query() only ever executes a single statement (multi-statement
+ * execution requires the separate multi_query()), which gives us the same
+ * "one statement per call" safety PDO's MYSQL_ATTR_MULTI_STATEMENTS=false
+ * provided, with no extra flag needed.
+ */
+function dbConnect(string $host, string $user, string $pass, int $port, string $db = ''): mysqli
 {
-    $dsn = "mysql:host={$host};port={$port};charset=utf8mb4" . ($db ? ";dbname={$db}" : '');
-    return new PDO($dsn, $user, $pass, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_TIMEOUT => 5]);
+    if (!class_exists('mysqli')) {
+        throw new RuntimeException(
+            "PHP's mysqli extension is not enabled on this server — DB features " .
+            '(credential test, SQL Console, Bitrix tools) are unavailable. ' .
+            'Ask your host to enable the mysqli extension.'
+        );
+    }
+    mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
+    $conn = mysqli_init();
+    $conn->options(MYSQLI_OPT_CONNECT_TIMEOUT, 5);
+    $conn->real_connect($host, $user, $pass, $db !== '' ? $db : null, $port);
+    $conn->set_charset('utf8mb4');
+    return $conn;
 }
 
 function handleTestDb(): void
 {
     try {
-        $pdo = dbConnect(
+        $conn = dbConnect(
             $_POST['db_host'] ?? 'localhost',
             $_POST['db_user'] ?? '',
             $_POST['db_pass'] ?? '',
             (int)($_POST['db_port'] ?? 3306),
             $_POST['db_name'] ?? ''
         );
-        $ver = $pdo->query('SELECT VERSION()')->fetchColumn();
+        $ver = $conn->query('SELECT VERSION()')->fetch_row()[0];
         jsonOk(['version' => $ver]);
+    } catch (Throwable $e) {
+        error_log('restore-42.php DB connect error: ' . $e->getMessage());
+        jsonErr('Connection failed — check host, port, credentials and firewall');
+    }
+}
+
+/**
+ * Notebook-style ad-hoc SQL execution against a caller-supplied connection.
+ * One statement per call — mysqli::query() only ever executes a single
+ * statement (multi-statement requires the separate multi_query()), matching
+ * the "one cell = one statement" notebook model. This tool already assumes
+ * a single trusted admin behind the login password; arbitrary SQL here is
+ * the intended capability, not a hole.
+ */
+function handleRunSql(): void
+{
+    $query = trim($_POST['query'] ?? '');
+    if ($query === '') {
+        jsonErr('Empty query');
+    }
+    try {
+        $conn = dbConnect(
+            $_POST['host'] ?? 'localhost',
+            $_POST['user'] ?? '',
+            $_POST['pass'] ?? '',
+            (int)($_POST['port'] ?? 3306),
+            $_POST['db'] ?? ''
+        );
+        $result = $conn->query($query);
+        if ($result instanceof mysqli_result) {
+            $rows = [];
+            $truncated = false;
+            $i = 0;
+            while ($row = $result->fetch_assoc()) {
+                if ($i++ >= 500) {
+                    $truncated = true;
+                    break;
+                }
+                $rows[] = $row;
+            }
+            jsonOk(['rows' => $rows, 'truncated' => $truncated]);
+        } else {
+            jsonOk(['affected' => $conn->affected_rows]);
+        }
     } catch (Throwable $e) {
         jsonErr($e->getMessage());
     }
@@ -558,16 +1722,20 @@ function handleImportSql(): void
     $db   = $_POST['db_name'] ?? '';
     $port = (int)($_POST['db_port'] ?? 3306);
 
+    if ($db && !preg_match('/^[a-zA-Z0-9_\-]+$/', $db)) {
+        jsonErr('Invalid database name — only letters, digits, underscores, and hyphens are allowed');
+    }
+
     try {
-        $pdo = dbConnect($host, $user, $pass, $port);
+        $conn = dbConnect($host, $user, $pass, $port);
         if ($db) {
             if (!empty($_POST['clean_db'])) {
-                $pdo->exec("DROP DATABASE IF EXISTS `{$db}`");
-                $pdo->exec("CREATE DATABASE `{$db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+                $conn->query("DROP DATABASE IF EXISTS `{$db}`");
+                $conn->query("CREATE DATABASE `{$db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
             } elseif (!empty($_POST['create_db'])) {
-                $pdo->exec("CREATE DATABASE IF NOT EXISTS `{$db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+                $conn->query("CREATE DATABASE IF NOT EXISTS `{$db}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
             }
-            $pdo->exec("USE `{$db}`");
+            $conn->query("USE `{$db}`");
         }
     } catch (Throwable $e) {
         jsonErr('DB connect: ' . $e->getMessage());
@@ -587,15 +1755,14 @@ function handleImportSql(): void
         if ($ret === 0) {
             jsonOk(['method' => 'cli']);
         }
-        // Fall through to PDO on failure
+        // Fall through to mysqli import on failure
     }
 
-    // PDO import
-    importViaPdo($pdo, $real);
-    jsonOk(['method' => 'pdo']);
+    importViaMysqli($conn, $real);
+    jsonOk(['method' => 'mysqli']);
 }
 
-function importViaPdo(PDO $pdo, string $file): void
+function importViaMysqli(mysqli $conn, string $file): void
 {
     $gz   = str_ends_with(strtolower($file), '.gz');
     $fh   = $gz ? gzopen($file, 'r') : fopen($file, 'r');
@@ -626,7 +1793,7 @@ function importViaPdo(PDO $pdo, string $file): void
             $q = trim(substr($buf, 0, -strlen($delim)));
             if ($q) {
                 try {
-                    $pdo->exec($q);
+                    $conn->query($q);
                 } catch (Throwable $e) {
                     error_log('SQL: ' . $e->getMessage());
                 }
@@ -642,10 +1809,7 @@ function importViaPdo(PDO $pdo, string $file): void
 function handleUpdateConfig(): void
 {
     $fw      = $_POST['framework'] ?? '';
-    $rootDir = realpath($_POST['root_dir'] ?? '');
-    if (!$rootDir) {
-        jsonErr('Directory not found');
-    }
+    $rootDir = requireExtractDir($_POST['root_dir'] ?? '');
 
     $cfg = [
         'host' => $_POST['db_host'] ?? 'localhost',
@@ -661,9 +1825,16 @@ function handleUpdateConfig(): void
         'wordpress' => cfgWordPress($rootDir, $cfg),
         'modx'      => cfgModx($rootDir, $cfg),
         'webasyst'  => cfgWebasyst($rootDir, $cfg),
+        'fslcms'    => cfgFslcms($rootDir, $cfg),
         default     => jsonErr("Unknown framework: {$fw}"),
     };
     jsonOk(['results' => $res]);
+}
+
+/** Escape a value for safe embedding inside a single-quoted PHP string literal. */
+function phpStrEscape(string $v): string
+{
+    return str_replace(['\\', "'"], ['\\\\', "\\'"], $v);
 }
 
 function cfgBitrix(string $dir, array $c): array
@@ -671,21 +1842,29 @@ function cfgBitrix(string $dir, array $c): array
     $res = [];
     $f   = $dir . '/bitrix/.settings.php';
     if (file_exists($f)) {
-        $s = file_get_contents($f);
-        $s = preg_replace("/'host'\s*=>\s*'[^']*'/", "'host' => '{$c['host']}'", $s);
-        $s = preg_replace("/'login'\s*=>\s*'[^']*'/", "'login' => '{$c['user']}'", $s);
-        $s = preg_replace("/'password'\s*=>\s*'[^']*'/", "'password' => '{$c['pass']}'", $s);
-        $s = preg_replace("/'database'\s*=>\s*'[^']*'/", "'database' => '{$c['db']}'", $s);
+        $s    = file_get_contents($f);
+        $host = phpStrEscape($c['host']);
+        $user = phpStrEscape($c['user']);
+        $pass = phpStrEscape($c['pass']);
+        $db   = phpStrEscape($c['db']);
+        $s = preg_replace("/'host'\s*=>\s*'[^']*'/", "'host' => '{$host}'", $s);
+        $s = preg_replace("/'login'\s*=>\s*'[^']*'/", "'login' => '{$user}'", $s);
+        $s = preg_replace("/'password'\s*=>\s*'[^']*'/", "'password' => '{$pass}'", $s);
+        $s = preg_replace("/'database'\s*=>\s*'[^']*'/", "'database' => '{$db}'", $s);
         file_put_contents($f, $s);
         $res[] = "Updated .settings.php";
     }
     $f2 = $dir . '/bitrix/php_interface/dbconn.php';
     if (file_exists($f2)) {
-        $s = file_get_contents($f2);
-        $s = preg_replace('/\$DBHost\s*=\s*"[^"]*"/', "\$DBHost = \"{$c['host']}\"", $s);
-        $s = preg_replace('/\$DBLogin\s*=\s*"[^"]*"/', "\$DBLogin = \"{$c['user']}\"", $s);
-        $s = preg_replace('/\$DBPassword\s*=\s*"[^"]*"/', "\$DBPassword = \"{$c['pass']}\"", $s);
-        $s = preg_replace('/\$DBName\s*=\s*"[^"]*"/', "\$DBName = \"{$c['db']}\"", $s);
+        $s    = file_get_contents($f2);
+        $host = phpStrEscape($c['host']);
+        $user = phpStrEscape($c['user']);
+        $pass = phpStrEscape($c['pass']);
+        $db   = phpStrEscape($c['db']);
+        $s = preg_replace('/\$DBHost\s*=\s*"[^"]*"/', "\$DBHost = \"{$host}\"", $s);
+        $s = preg_replace('/\$DBLogin\s*=\s*"[^"]*"/', "\$DBLogin = \"{$user}\"", $s);
+        $s = preg_replace('/\$DBPassword\s*=\s*"[^"]*"/', "\$DBPassword = \"{$pass}\"", $s);
+        $s = preg_replace('/\$DBName\s*=\s*"[^"]*"/', "\$DBName = \"{$db}\"", $s);
         file_put_contents($f2, $s);
         $res[] = "Updated dbconn.php";
     }
@@ -701,21 +1880,23 @@ function cfgWordPress(string $dir, array $c): array
     if (!file_exists($f)) {
         return ['wp-config.php not found'];
     }
-    $s = file_get_contents($f);
+    $s   = file_get_contents($f);
     $map = ['DB_HOST' => $c['host'], 'DB_USER' => $c['user'], 'DB_PASSWORD' => $c['pass'], 'DB_NAME' => $c['db']];
     foreach ($map as $k => $v) {
+        $safe = phpStrEscape($v);
         $s = preg_replace(
             "/define\s*\(\s*['\"]" . $k . "['\"]\s*,\s*['\"][^'\"]*['\"]\s*\)/",
-            "define('{$k}', '{$v}')",
+            "define('{$k}', '{$safe}')",
             $s
         );
     }
     if ($c['url']) {
+        $safeUrl = phpStrEscape($c['url']);
         foreach (['WP_SITEURL', 'WP_HOME'] as $k) {
             if (str_contains($s, $k)) {
                 $s = preg_replace(
                     "/define\s*\(\s*['\"]" . $k . "['\"]\s*,\s*['\"][^'\"]*['\"]\s*\)/",
-                    "define('{$k}', '{$c['url']}')",
+                    "define('{$k}', '{$safeUrl}')",
                     $s
                 );
             }
@@ -724,7 +1905,7 @@ function cfgWordPress(string $dir, array $c): array
     file_put_contents($f, $s);
     $res = ['Updated wp-config.php'];
     if ($c['url']) {
-        $res[] = 'Also run: UPDATE wp_options SET option_value="' . $c['url'] . '" WHERE option_name IN ("siteurl","home")';
+        $res[] = 'Also run: UPDATE wp_options SET option_value="' . htmlspecialchars($c['url'], ENT_QUOTES) . '" WHERE option_name IN ("siteurl","home")';
     }
     return $res;
 }
@@ -737,15 +1918,21 @@ function cfgModx(string $dir, array $c): array
     if (!file_exists($f)) {
         return ['MODX config not found'];
     }
-    $s = file_get_contents($f);
-    $s = preg_replace("/\\\$database_server\s*=\s*'[^']*'/", "\$database_server = '{$c['host']}'", $s);
-    $s = preg_replace("/\\\$database_user\s*=\s*'[^']*'/", "\$database_user = '{$c['user']}'", $s);
-    $s = preg_replace("/\\\$database_password\s*=\s*'[^']*'/", "\$database_password = '{$c['pass']}'", $s);
-    $s = preg_replace("/\\\$dbase\s*=\s*'[^']*'/", "\$dbase = '{$c['db']}'", $s);
-    $s = preg_replace("/\\\$database_name\s*=\s*'[^']*'/", "\$database_name = '{$c['db']}'", $s);
+    $s    = file_get_contents($f);
+    $host = phpStrEscape($c['host']);
+    $user = phpStrEscape($c['user']);
+    $pass = phpStrEscape($c['pass']);
+    $db   = phpStrEscape($c['db']);
+    $s = preg_replace("/\\\$database_server\s*=\s*'[^']*'/", "\$database_server = '{$host}'", $s);
+    $s = preg_replace("/\\\$database_user\s*=\s*'[^']*'/", "\$database_user = '{$user}'", $s);
+    $s = preg_replace("/\\\$database_password\s*=\s*'[^']*'/", "\$database_password = '{$pass}'", $s);
+    $s = preg_replace("/\\\$dbase\s*=\s*'[^']*'/", "\$dbase = '{$db}'", $s);
+    $s = preg_replace("/\\\$database_name\s*=\s*'[^']*'/", "\$database_name = '{$db}'", $s);
     if ($c['url']) {
-        $s = preg_replace("/\\\$site_url\s*=\s*'[^']*'/", "\$site_url = '{$c['url']}/'", $s);
-        $s = preg_replace("/\\\$base_path\s*=\s*'[^']*'/", "\$base_path = '{$dir}/'", $s);
+        $safeUrl = phpStrEscape($c['url']);
+        $safeDir = phpStrEscape($dir);
+        $s = preg_replace("/\\\$site_url\s*=\s*'[^']*'/", "\$site_url = '{$safeUrl}/'", $s);
+        $s = preg_replace("/\\\$base_path\s*=\s*'[^']*'/", "\$base_path = '{$safeDir}/'", $s);
     }
     file_put_contents($f, $s);
     return ['Updated ' . basename($f)];
@@ -753,22 +1940,27 @@ function cfgModx(string $dir, array $c): array
 
 function cfgWebasyst(string $dir, array $c): array
 {
-    $res = [];
-    $f = $dir . '/wa-config/db.php';
+    $res  = [];
+    $f    = $dir . '/wa-config/db.php';
     if (file_exists($f)) {
-        $s = file_get_contents($f);
-        $s = preg_replace("/'host'\s*=>\s*'[^']*'/", "'host' => '{$c['host']}'", $s);
-        $s = preg_replace("/'user'\s*=>\s*'[^']*'/", "'user' => '{$c['user']}'", $s);
-        $s = preg_replace("/'password'\s*=>\s*'[^']*'/", "'password' => '{$c['pass']}'", $s);
-        $s = preg_replace("/'database'\s*=>\s*'[^']*'/", "'database' => '{$c['db']}'", $s);
+        $s    = file_get_contents($f);
+        $host = phpStrEscape($c['host']);
+        $user = phpStrEscape($c['user']);
+        $pass = phpStrEscape($c['pass']);
+        $db   = phpStrEscape($c['db']);
+        $s = preg_replace("/'host'\s*=>\s*'[^']*'/", "'host' => '{$host}'", $s);
+        $s = preg_replace("/'user'\s*=>\s*'[^']*'/", "'user' => '{$user}'", $s);
+        $s = preg_replace("/'password'\s*=>\s*'[^']*'/", "'password' => '{$pass}'", $s);
+        $s = preg_replace("/'database'\s*=>\s*'[^']*'/", "'database' => '{$db}'", $s);
         file_put_contents($f, $s);
         $res[] = 'Updated wa-config/db.php';
     }
     if ($c['url']) {
         $f2 = $dir . '/wa-config/config.php';
         if (file_exists($f2)) {
-            $s = file_get_contents($f2);
-            $s = preg_replace("/'url'\s*=>\s*'[^']*'/", "'url' => '{$c['url']}'", $s);
+            $s       = file_get_contents($f2);
+            $safeUrl = phpStrEscape($c['url']);
+            $s       = preg_replace("/'url'\s*=>\s*'[^']*'/", "'url' => '{$safeUrl}'", $s);
             file_put_contents($f2, $s);
             $res[] = 'Updated wa-config/config.php';
         }
@@ -776,21 +1968,92 @@ function cfgWebasyst(string $dir, array $c): array
     return $res ?: ['No Webasyst config files found'];
 }
 
+function cfgFslcms(string $dir, array $c): array
+{
+    $f = $dir . '/setup.php';
+    if (!file_exists($f)) {
+        return ['setup.php not found'];
+    }
+    $s   = file_get_contents($f);
+    // Site URL is derived from $_SERVER['SERVER_NAME'] at runtime — no site_url rewrite here.
+    $map = ['DBHOST' => $c['host'], 'DBLOGIN' => $c['user'], 'DBPASSWORD' => $c['pass'], 'DBNAME' => $c['db']];
+    foreach ($map as $k => $v) {
+        $safe = phpStrEscape($v);
+        $s = preg_replace(
+            "/define\s*\(\s*['\"]" . $k . "['\"]\s*,\s*['\"][^'\"]*['\"]\s*\)/",
+            "define('{$k}', '{$safe}')",
+            $s
+        );
+    }
+    file_put_contents($f, $s);
+    return ['Updated setup.php'];
+}
+
+/**
+ * Resolve a user-supplied directory path and verify it is within EXTRACT_DIR.
+ * Calls jsonErr() and exits on failure.
+ */
+function requireExtractDir(string $raw): string
+{
+    $real = realpath($raw);
+    $base = realpath(EXTRACT_DIR);
+    if (!$real || !$base || (!str_starts_with($real . '/', $base . '/') && $real !== $base)) {
+        jsonErr('Directory must be within the extract area');
+    }
+    return $real;
+}
+
+/**
+ * Resolve a user-supplied directory path and verify it is either within
+ * EXTRACT_DIR (an extracted backup) or within this script's own directory
+ * (the live site, when Site Info fell back to scanning it directly).
+ */
+function requireSiteDir(string $raw): string
+{
+    $real = realpath($raw);
+    if (!$real) {
+        jsonErr('Directory not found');
+    }
+    $extractBase = realpath(EXTRACT_DIR);
+    $liveBase    = realpath(__DIR__);
+    $inExtract   = $extractBase && (str_starts_with($real . '/', $extractBase . '/') || $real === $extractBase);
+    $inLive      = $liveBase && (str_starts_with($real . '/', $liveBase . '/') || $real === $liveBase);
+    if (!$inExtract && !$inLive) {
+        jsonErr('Directory not allowed');
+    }
+    return $real;
+}
+
+function dirSize(string $dir): int
+{
+    $size = 0;
+    foreach (new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS)) as $f) {
+        if ($f->isFile()) {
+            $size += $f->getSize();
+        }
+    }
+    return $size;
+}
+
+function handleDirSize(): void
+{
+    $dir = requireSiteDir($_POST['dir'] ?? '');
+    jsonOk(['dir' => $dir, 'size' => dirSize($dir)]);
+}
+
 // ── Cache clearing ────────────────────────────────────────────────────────────
 
 function handleClearCache(): void
 {
     $fw  = $_POST['framework'] ?? '';
-    $dir = realpath($_POST['root_dir'] ?? '');
-    if (!$dir) {
-        jsonErr('Directory not found');
-    }
+    $dir = requireExtractDir($_POST['root_dir'] ?? '');
 
     $dirs = match ($fw) {
         'bitrix'    => [$dir . '/bitrix/cache', $dir . '/bitrix/managed_cache', $dir . '/bitrix/stack_cache'],
         'wordpress' => [$dir . '/wp-content/cache'],
         'modx'      => [$dir . '/core/cache', $dir . '/assets/cache'],
         'webasyst'  => [$dir . '/wa-cache'],
+        'fslcms'    => [$dir . '/cache'],
         default     => [],
     };
 
@@ -809,10 +2072,7 @@ function handleClearCache(): void
 function handleHtaccess(): void
 {
     $fw  = $_POST['framework'] ?? '';
-    $dir = realpath($_POST['root_dir'] ?? '');
-    if (!$dir) {
-        jsonErr('Directory not found');
-    }
+    $dir = requireExtractDir($_POST['root_dir'] ?? '');
 
     $f = $dir . '/.htaccess';
     if (file_exists($f)) {
@@ -842,6 +2102,11 @@ function handleBackup(): void
     $db      = $_POST['db_name'] ?? '';
     $port    = (int)($_POST['db_port'] ?? 3306);
     $split   = (int)($_POST['split_mb'] ?? 100);
+    $dbOnly  = !empty($_POST['db_only']);
+
+    if ($dbOnly && !$db) {
+        jsonErr('DB name is required for a DB-only backup');
+    }
 
     $ts   = date('Ymd_His');
     $base = BACKUPS_DIR . '/backup_' . $ts;
@@ -866,36 +2131,57 @@ function handleBackup(): void
         }
     }
 
-    // 2. Files archive
-    $archive = $base . '.tar.gz';
-    $excludes = ' --exclude=' . escapeshellarg(basename(WORK_DIR))
-              . ' --exclude=' . escapeshellarg(basename(__FILE__));
-    $tarCmd = "tar -czf " . escapeshellarg($archive) . $excludes .
-              " -C " . escapeshellarg(dirname($rootDir)) . " " . escapeshellarg(basename($rootDir)) . " 2>&1";
-    exec($tarCmd, $o, $ret);
+    // 2. Files archive — prefer shell tar (faster, supports --exclude);
+    //    fall back to PharData for hosts where tar is not available.
+    //    Skipped entirely for a DB-only backup.
+    if (!$dbOnly) {
+        $archive = $base . '.tar.gz';
+        $excludes = ' --exclude=' . escapeshellarg(basename(WORK_DIR))
+                  . ' --exclude=' . escapeshellarg(basename(__FILE__));
+        $tarCmd = "tar -czf " . escapeshellarg($archive) . $excludes .
+                  " -C " . escapeshellarg(dirname($rootDir)) . " " . escapeshellarg(basename($rootDir)) . " 2>&1";
+        exec($tarCmd, $o, $ret);
 
-    if ($ret === 0 && file_exists($archive)) {
-        $sz = filesize($archive);
-        if ($split > 0 && $sz > $split * 1048576) {
-            $splitCmd = "split -b {$split}m " . escapeshellarg($archive) . " " . escapeshellarg($archive . '.') . " 2>&1";
-            exec($splitCmd, $o2, $ret2);
-            if ($ret2 === 0) {
-                unlink($archive);
-                $res[] = "Archive split into {$split}MB parts (Bitrix format)";
+        if ($ret !== 0 || !file_exists($archive)) {
+            // shell tar unavailable — use PharData
+            $ret = createTarGzNative($rootDir, $archive, [basename(WORK_DIR), basename(__FILE__)]) ? 0 : 1;
+            $o   = $ret !== 0 ? ['PharData archive creation failed'] : [];
+        }
+
+        if ($ret === 0 && file_exists($archive)) {
+            $sz = filesize($archive);
+            if ($split > 0 && $sz > $split * 1048576) {
+                $splitCmd = "split -b {$split}m " . escapeshellarg($archive) . " " . escapeshellarg($archive . '.') . " 2>&1";
+                exec($splitCmd, $o2, $ret2);
+                if ($ret2 === 0) {
+                    unlink($archive);
+                    $res[] = "Archive split into {$split}MB parts (Bitrix format)";
+                } else {
+                    embedFileSha256($archive);
+                    $res[] = "Archive: backup_{$ts}.tar.gz (" . fmtSize($sz) . ")";
+                }
             } else {
+                embedFileSha256($archive);
                 $res[] = "Archive: backup_{$ts}.tar.gz (" . fmtSize($sz) . ")";
             }
         } else {
-            $res[] = "Archive: backup_{$ts}.tar.gz (" . fmtSize($sz) . ")";
+            $res[] = "tar failed: " . implode(' ', $o);
         }
-    } else {
-        $res[] = "tar failed: " . implode(' ', $o);
     }
 
-    // Collect files
+    // Collect files, embedding SHA-256 in any split parts
     $files = [];
     foreach (glob($base . '*') as $f) {
-        $files[] = ['name' => basename($f), 'size' => filesize($f)];
+        // Parts from `split` have no embedded hash yet — add one
+        if (!readEmbeddedSha256($f)) {
+            embedFileSha256($f);
+        }
+        $h = readEmbeddedSha256($f);
+        $files[] = [
+            'name'   => basename($f),
+            'size'   => filesize($f),
+            'sha256' => $h ? substr($h, 0, 8) . '…' : null,
+        ];
     }
 
     jsonOk(['results' => $res, 'files' => $files]);
@@ -903,13 +2189,54 @@ function handleBackup(): void
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
+/**
+ * Create a .tar.gz from $rootDir using PharData (no shell dependency).
+ * $exclude: basenames to skip at the root level.
+ */
+function createTarGzNative(string $rootDir, string $dest, array $exclude = []): bool
+{
+    $tarPath = substr($dest, 0, -3); // strip .gz → .tar
+    try {
+        $phar = new PharData($tarPath);
+        $it   = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($rootDir, FilesystemIterator::SKIP_DOTS)
+        );
+        foreach ($it as $file) {
+            $rel = substr($file->getPathname(), strlen($rootDir) + 1);
+            $top = explode(DIRECTORY_SEPARATOR, $rel)[0];
+            if (in_array($top, $exclude, true)) {
+                continue;
+            }
+            if ($file->isFile()) {
+                $phar->addFile($file->getPathname(), $rel);
+            }
+        }
+        $phar->compress(Phar::GZ);     // creates $tarPath.gz
+        unlink($tarPath);
+        // PharData names the output $tarPath.gz, we want $dest (.tar.gz)
+        if ($tarPath . '.gz' !== $dest && file_exists($tarPath . '.gz')) {
+            rename($tarPath . '.gz', $dest);
+        }
+        return file_exists($dest);
+    } catch (Throwable $e) {
+        @unlink($tarPath);
+        return false;
+    }
+}
+
 function countFiles(string $dir): int
 {
+    $realDir = rtrim(realpath($dir) ?: $dir, '/');
     $n = 0;
     foreach (new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS)) as $f) {
-        if ($f->isFile()) {
-            $n++;
+        if (!$f->isFile()) {
+            continue;
         }
+        // Exclude our own access guard sitting directly in $dir (not real content)
+        if (rtrim($f->getPath(), '/') === $realDir && in_array($f->getFilename(), ['index.php', '.htaccess'], true)) {
+            continue;
+        }
+        $n++;
     }
     return $n;
 }
@@ -976,6 +2303,123 @@ function handleDownloadBackup(): never
     header('Content-Length: ' . filesize($path));
     header('Cache-Control: no-cache');
     readfile($path);
+    exit;
+}
+
+// ── Upstream Bitrix scripts ───────────────────────────────────────────────────
+
+function handleDownloadUpstream(): void
+{
+    $scripts = [
+        'restore'      => ['url' => 'https://www.1c-bitrix.ru/download/scripts/restore.php',      'file' => 'restore.php'],
+        'bitrixsetup'  => ['url' => 'https://www.1c-bitrix.ru/download/scripts/bitrixsetup.php',  'file' => 'bitrixsetup.php'],
+    ];
+    $key  = $_POST['script'] ?? '';
+    if (!isset($scripts[$key])) {
+        jsonErr('Unknown script');
+    }
+    $url  = $scripts[$key]['url'];
+    $dest = __DIR__ . '/' . $scripts[$key]['file'];
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_TIMEOUT        => 60,
+        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYHOST => 2,
+        CURLOPT_USERAGENT      => 'Mozilla/5.0',
+    ]);
+    $body = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err  = curl_error($ch);
+    curl_close($ch);
+
+    if ($body === false || $code !== 200) {
+        jsonErr('Download failed: ' . ($err ?: "HTTP $code"));
+    }
+    if (file_put_contents($dest, $body) === false) {
+        jsonErr('Could not write file — check permissions on ' . __DIR__);
+    }
+    jsonOk(['file' => $scripts[$key]['file'], 'size' => strlen($body)]);
+}
+
+/**
+ * Emulate the classic "2.php" emergency-admin-login trick directly, with no
+ * file left on disk. Bootstraps Bitrix's own prolog, authorizes as user #1
+ * (superadmin), then redirects into the admin panel. Reached via a plain
+ * GET navigation (window.open), same as opening 2.php would have been.
+ */
+function handleBitrixAdminAuth(): never
+{
+    $docRoot = rtrim($_SERVER['DOCUMENT_ROOT'] ?? '', '/');
+    $header  = $docRoot !== '' ? $docRoot . '/bitrix/header.php' : '';
+    if ($header === '' || !file_exists($header)) {
+        $header = __DIR__ . '/bitrix/header.php'; // fallback if DOCUMENT_ROOT is unreliable
+    }
+    if (!file_exists($header)) {
+        http_response_code(500);
+        header('Content-Type: text/plain');
+        echo "bitrix/header.php not found — this script is not sitting inside a Bitrix site root.";
+        exit;
+    }
+    define('NO_KEEP_STATISTIC', true);
+    define('NOT_CHECK_PERMISSIONS', true);
+    ob_start();
+    require $header;
+    ob_end_clean();
+    global $USER;
+    $USER->Authorize(1);
+    if (function_exists('LocalRedirect')) {
+        LocalRedirect('/bitrix/admin/');
+    }
+    header('Location: /bitrix/admin/');
+    exit;
+}
+
+/**
+ * Ground truth for "which site is current", straight from Bitrix's own
+ * kernel — bootstraps bitrix/header.php (output suppressed, no Authorize/
+ * redirect) and echoes the SITE_ID constant it resolves as plain text.
+ *
+ * PHP cannot "unload" an include — once header.php runs, its classes/
+ * constants/globals are permanent for the rest of THIS process — so this
+ * must never run inside the same request that then goes on to do more
+ * work. Instead it's a normal authenticated action, called directly by the
+ * BROWSER as a separate request (plain fetch()), which is handled by a
+ * fresh PHP-FPM worker / Apache child with its own process memory. This
+ * sidesteps every server-side self-request mechanism (exec/shell_exec,
+ * curl, allow_url_fopen) — all routinely disabled via disable_functions on
+ * exactly the shared hosting this tool targets — since the browser's own
+ * networking is used instead, which is always available.
+ */
+function handleBitrixSiteIdInternal(): never
+{
+    header('Content-Type: text/plain');
+    $docRoot = rtrim($_SERVER['DOCUMENT_ROOT'] ?? '', '/');
+    $header  = $docRoot !== '' ? $docRoot . '/bitrix/header.php' : '';
+    if ($header === '' || !file_exists($header)) {
+        $header = __DIR__ . '/bitrix/header.php';
+    }
+    if (!file_exists($header)) {
+        exit; // empty body — caller treats as "could not verify"
+    }
+    if (!defined('NO_KEEP_STATISTIC')) {
+        define('NO_KEEP_STATISTIC', true);
+    }
+    if (!defined('NOT_CHECK_PERMISSIONS')) {
+        define('NOT_CHECK_PERMISSIONS', true);
+    }
+    try {
+        ob_start();
+        require $header;
+        ob_end_clean();
+        echo defined('SITE_ID') ? SITE_ID : '';
+    } catch (Throwable $e) {
+        if (ob_get_level() > 0) {
+            ob_end_clean();
+        }
+    }
     exit;
 }
 
@@ -1059,9 +2503,9 @@ select option{background:#1a1d27}
 .step-pill.active{background:#1e1b4b;color:#818cf8;border-color:#4f46e5}
 .step-pill.locked{background:#1a1d27;color:#475569;cursor:not-allowed}
 #auth-screen{display:flex;align-items:center;justify-content:center;min-height:100vh;background:#0f1117}
-.auth-box{background:#1a1d27;border:1px solid #2d3148;border-radius:12px;padding:40px;width:360px}
+.auth-box{background:#1a1d27;border:1px solid #2d3148;border-radius:12px;padding:40px;width:320px;flex-shrink:0}
 .auth-box h2{font-size:20px;font-weight:700;margin-bottom:6px;color:#e2e8f0}
-.auth-box p{font-size:13px;color:#64748b;margin-bottom:24px}
+.auth-box p{font-size:13px;color:#64748b;margin-bottom:20px}
 .auth-box input{margin-bottom:12px}
 .drop-zone{border:2px dashed #2d3148;border-radius:8px;padding:32px;text-align:center;cursor:pointer;transition:all .15s}
 .drop-zone:hover,.drop-zone.drag{border-color:#4f46e5;background:#1e1b4b22}
@@ -1083,13 +2527,7 @@ select option{background:#1a1d27}
 <body>
 
 <div id="auth-screen" style="display:none">
-  <div class="auth-box">
-    <h2><?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?></h2>
-    <p id="auth-hint">Loading…</p>
-    <input type="password" id="auth-pw" placeholder="Password" autocomplete="current-password">
-    <button class="btn btn-primary" style="width:100%" onclick="doLogin()">Continue</button>
-    <div id="auth-err" class="alert alert-err" style="display:none;margin-top:12px"></div>
-  </div>
+  <div id="auth-inner"></div>
 </div>
 
 <div id="main-app" style="display:none">
@@ -1097,11 +2535,20 @@ select option{background:#1a1d27}
   <div class="sidebar">
     <div class="sidebar-logo">restore<span>.php</span></div>
     <div class="nav">
-      <div class="nav-item active" onclick="showTab('restore')" id="tab-restore">
+      <div class="nav-item active" onclick="showTab('frameworkinfo')" id="tab-frameworkinfo">
+        <span class="icon">🔍</span> Framework Info
+      </div>
+      <div class="nav-item" onclick="showTab('serverinfo')" id="tab-serverinfo">
+        <span class="icon">🖥️</span> Server Info
+      </div>
+      <div class="nav-item" onclick="showTab('restore')" id="tab-restore">
         <span class="icon">🔄</span> Restore
       </div>
       <div class="nav-item" onclick="showTab('backup')" id="tab-backup">
         <span class="icon">📦</span> Backup
+      </div>
+      <div class="nav-item" onclick="showTab('sqlconsole')" id="tab-sqlconsole">
+        <span class="icon">💻</span> SQL Console
       </div>
     </div>
     <div style="padding:16px 20px;border-top:1px solid #2d3148">
@@ -1280,9 +2727,67 @@ select option{background:#1a1d27}
             <p style="color:#64748b;margin-bottom:24px">Check the site, then delete <code><?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?></code> and the <code>.restore/</code> directory.</p>
             <button class="btn btn-danger" onclick="if(confirm('Delete <?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?>?'))alert('Delete it manually — this tool cannot delete itself safely.')">Delete <?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?></button>
           </div>
+
         </div>
 
       </div><!-- /pane-restore -->
+
+      <!-- ── FRAMEWORK INFO TAB ────────────────────────────────── -->
+      <div id="pane-frameworkinfo">
+        <div class="panel">
+          <div class="panel-title" style="display:flex;align-items:center;justify-content:space-between">
+            Framework Info
+            <button class="btn btn-secondary btn-sm" onclick="runAutoScan()">↻ Rescan</button>
+          </div>
+          <div id="frameworkinfo-body">
+            <p style="color:#64748b;font-size:13px">Scanning…</p>
+          </div>
+        </div>
+
+        <!-- Shown only when the detected framework is Bitrix -->
+        <div class="panel" id="bitrix-tools-panel" style="display:none">
+          <div class="panel-title">Bitrix Tools</div>
+
+          <div style="margin-bottom:20px">
+            <div style="font-size:13px;font-weight:600;color:#e2e8f0;margin-bottom:6px">Official Bitrix scripts</div>
+            <p style="color:#94a3b8;font-size:13px;margin-bottom:12px">Fetch from 1c-bitrix.ru and save to this directory.</p>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+              <button class="btn btn-secondary" onclick="doGetUpstream('restore')">⬇ restore.php</button>
+              <button class="btn btn-secondary" onclick="doGetUpstream('bitrixsetup')">⬇ bitrixsetup.php</button>
+              <span id="upstream-result" style="font-size:13px;color:#94a3b8"></span>
+            </div>
+          </div>
+
+          <div style="margin-bottom:20px">
+            <div style="font-size:13px;font-weight:600;color:#e2e8f0;margin-bottom:6px">Emergency admin login</div>
+            <p style="color:#94a3b8;font-size:13px;margin-bottom:12px">Opens a Bitrix session as superadmin (user ID&nbsp;1) and redirects into the admin panel — no file is written to disk.</p>
+            <a class="btn btn-primary" href="<?= htmlspecialchars(basename(__FILE__), ENT_QUOTES) ?>?action=bitrix_login" target="_blank" rel="noopener">Login as Admin</a>
+          </div>
+
+          <div>
+            <div style="font-size:13px;font-weight:600;color:#e2e8f0;margin-bottom:6px">Developer mode (main.update_devsrv)</div>
+            <p style="color:#facc15;font-size:12px;margin-bottom:12px">⚠ Per Bitrix's own documentation, switches to this mode are tracked by their license servers, and using it on a live production site is against license terms — it's meant for shared dev/staging installs. This is unrelated to the domain-license-mismatch warning, which is a separate account-portal mechanism.</p>
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+              <span id="devmode-badge" style="font-size:13px;font-weight:700;padding:5px 12px;border-radius:6px">—</span>
+              <button class="btn btn-secondary btn-sm" onclick="toggleDevMode()">Flip</button>
+            </div>
+            <div id="devmode-domain-warning" style="display:none;font-size:12px;color:#facc15"></div>
+          </div>
+        </div>
+      </div><!-- /pane-frameworkinfo -->
+
+      <!-- ── SERVER INFO TAB ───────────────────────────────────── -->
+      <div id="pane-serverinfo" style="display:none">
+        <div class="panel">
+          <div class="panel-title" style="display:flex;align-items:center;justify-content:space-between">
+            Server Info
+            <button class="btn btn-secondary btn-sm" onclick="runAutoScan()">↻ Rescan</button>
+          </div>
+          <div id="serverinfo-body">
+            <p style="color:#64748b;font-size:13px">Scanning…</p>
+          </div>
+        </div>
+      </div><!-- /pane-serverinfo -->
 
       <!-- ── BACKUP TAB ──────────────────────────────────────────── -->
       <div id="pane-backup" style="display:none">
@@ -1303,15 +2808,51 @@ select option{background:#1a1d27}
             <div class="form-group"><label>DB Password</label><input type="password" id="bk-pass"></div>
             <div class="form-group"><label>DB Name</label><input id="bk-db"></div>
           </div>
-          <div class="form-row">
+          <div class="form-row" id="bk-split-row">
             <div class="form-group" style="flex:0 0 160px">
               <label>Split size (MB, 0=no split)</label>
               <input id="bk-split" value="2047">
+            </div>
+            <div class="form-group" style="flex:0 0 auto;align-self:flex-end;padding-bottom:8px">
+              <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+                <input type="checkbox" id="bk-db-only" onchange="document.getElementById('bk-split').disabled = this.checked">
+                DB only (skip file archive)
+              </label>
             </div>
           </div>
           <button class="btn btn-primary" onclick="doBackup()">Create Backup</button>
           <div id="backup-log" class="log" style="display:none"></div>
           <div id="backup-files" style="margin-top:12px"></div>
+        </div>
+      </div>
+
+      <!-- ── SQL CONSOLE TAB ───────────────────────────────────── -->
+      <div id="pane-sqlconsole" style="display:none">
+        <div class="panel">
+          <div class="panel-title">SQL Console</div>
+          <div style="margin-bottom:12px">
+            <button class="btn btn-secondary btn-sm" onclick="useDetectedSqlCreds()">🔍 Use detected site creds</button>
+            <span style="font-size:12px;color:#64748b;margin-left:8px">or type your own connection below</span>
+          </div>
+          <div class="form-row">
+            <div class="form-group"><label>DB Host</label><input id="sql-host" value="localhost"></div>
+            <div class="form-group" style="flex:0 0 80px"><label>Port</label><input id="sql-port" value="3306"></div>
+            <div class="form-group"><label>DB User</label><input id="sql-user"></div>
+            <div class="form-group"><label>DB Password</label><input type="password" id="sql-pass"></div>
+            <div class="form-group"><label>DB Name</label><input id="sql-db"></div>
+          </div>
+
+          <div id="sql-tabs-bar" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid #2d3148"></div>
+
+          <div id="sql-cells" style="display:flex;flex-direction:column;gap:12px;margin-bottom:12px;max-height:520px;overflow-y:auto"></div>
+
+          <textarea id="sql-input" rows="4" placeholder="SELECT * FROM b_option WHERE MODULE_ID='main' LIMIT 20;&#10;&#10;One statement per cell — Ctrl+Enter (⌘+Enter) to run."
+                    style="width:100%;font-family:monospace;font-size:13px;background:#0f1117;border:1px solid #2d3148;border-radius:6px;padding:10px;color:#e2e8f0;resize:vertical"
+                    onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter'){event.preventDefault();runSqlCell();}"></textarea>
+          <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+            <button class="btn btn-primary" onclick="runSqlCell()">▶ Run <span style="opacity:.6;font-size:11px">(Ctrl+Enter)</span></button>
+            <button class="btn btn-secondary btn-sm" onclick="clearActiveSqlTab()">Clear tab</button>
+          </div>
         </div>
       </div>
 
@@ -1331,32 +2872,194 @@ window.addEventListener('beforeunload', e => {
 
 // ── Auth ─────────────────────────────────────────────────────────────────────
 
+const SCRIPT_NAME = <?= json_encode(basename(__FILE__)) ?>;
+
 async function init() {
   const r = await fetch(API('check_auth')).then(r=>r.json());
-  if (r.auth) { showApp(); }
-  else { showAuthScreen(false); }
+  if (r.auth) { showApp(); return; }
+  showAuthScreen(r.mode || 'first_run', r.bitrix_available || false);
 }
 
-function showAuthScreen(firstRun) {
-  document.getElementById('auth-screen').style.display = '';
+function showAuthScreen(mode, bitrixAvailable) {
   document.getElementById('main-app').style.display = 'none';
-  document.getElementById('auth-hint').textContent = firstRun
-    ? 'First run — set a password to continue.' : 'Enter your restore password.';
-  document.getElementById('auth-pw').focus();
+  document.getElementById('auth-screen').style.display = '';
+
+  const inner = document.getElementById('auth-inner');
+  const isBitrixLocked = mode === 'bitrix' && !bitrixAvailable;
+
+  // Each box owns its input + button, scoped via closest('.auth-box') so a
+  // click always reads THAT box's own field regardless of which box last had
+  // focus. Empty submissions are caught with an inline error in submitLogin().
+  const authBox = (hint, placeholder, btnLabel, via, accent) => `
+    <div class="auth-box">
+      <h2>${SCRIPT_NAME}</h2>
+      <p>${hint}</p>
+      <input type="password" class="auth-pw-input" data-via="${via}" placeholder="${placeholder}"
+             autocomplete="current-password"
+             onkeydown="if(event.key==='Enter')submitLogin(this)">
+      <button class="btn btn-primary" style="width:100%${accent ? `;background:${accent};border-color:${accent}` : ''}"
+              onclick="submitLogin(this.previousElementSibling)">${btnLabel}</button>
+      <div class="auth-err alert alert-err" style="display:none;margin-top:12px"></div>
+    </div>`;
+
+  const localBox   = (hint, btnLabel) => authBox(hint, 'Password', btnLabel, 'local', null);
+  const bitrixBox   = (hint) => authBox(hint, 'Bitrix admin password', 'Login with Bitrix', 'bitrix', '#f97316');
+
+  let html = '<div style="display:flex;gap:24px;flex-wrap:wrap;justify-content:center">';
+
+  if (isBitrixLocked) {
+    html += `<div class="auth-box">
+      <h2>${SCRIPT_NAME}</h2>
+      <p style="color:#ef4444">Bitrix auth mode is set but Bitrix is not found at this path.</p>
+      <p style="font-size:12px;color:#64748b">To reset: open the script file and clear the <code>STORED_PASS_HASH</code> constant, then reload.</p>
+    </div>`;
+  } else if (mode === 'first_run') {
+    html += localBox('Set a password to protect this tool.', 'Set Password &amp; Login');
+    if (bitrixAvailable) html += bitrixBox('Or use your Bitrix admin (user #1) password instead.');
+  } else if (mode === 'bitrix') {
+    html += bitrixBox('This tool is linked to Bitrix — use your admin (user #1) password.');
+  } else {
+    html += localBox('Enter your restore password.', 'Login');
+    if (bitrixAvailable) html += bitrixBox('Or login directly with your Bitrix admin password.');
+  }
+
+  html += '</div>';
+  inner.innerHTML = html;
+  inner.querySelector('.auth-pw-input')?.focus();
+}
+
+async function submitLogin(inputEl) {
+  let pw  = inputEl.value;
+  let via = inputEl.dataset.via;
+
+  // If this box's own field is empty, use whichever OTHER field on screen
+  // actually has content — a click on either button should just work
+  // regardless of which box the password was typed into.
+  if (!pw) {
+    const filled = Array.from(document.querySelectorAll('.auth-pw-input')).find(el => el.value);
+    if (filled) {
+      inputEl = filled;
+      pw  = filled.value;
+      via = filled.dataset.via;
+    }
+  }
+
+  const err = inputEl.closest('.auth-box').querySelector('.auth-err');
+  err.style.display = 'none';
+
+  if (!pw) {
+    err.textContent = 'Type your password first.';
+    err.style.display = '';
+    inputEl.focus();
+    return;
+  }
+
+  const r = await post('login', {password: pw, via});
+  if (!r.ok) {
+    err.textContent = r.error;
+    err.style.display = '';
+    return;
+  }
+  // Init vault with the password used — best-effort; WebCrypto requires a
+  // secure context (HTTPS/localhost), so this is unavailable over plain HTTP.
+  // Login must still succeed either way.
+  if (window.crypto?.subtle) {
+    try {
+      const existing = localStorage.getItem(VAULT_KEY);
+      if (existing) {
+        const saved = await vaultLoad(pw);
+        if (saved) vaultApplyToForms(saved);
+        else await vaultInit(pw);
+      } else {
+        await vaultInit(pw);
+      }
+    } catch (e) {
+      console.warn('Credential vault unavailable:', e);
+    }
+  }
+  showApp();
 }
 
 document.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && document.getElementById('auth-screen').style.display !== 'none') doLogin();
+  // Legacy fallback — individual inputs use onkeydown directly
 });
 
-async function doLogin() {
-  const pw = document.getElementById('auth-pw').value;
-  const r = await post('login', {password: pw});
-  if (r.ok) { showApp(); }
-  else { const el = document.getElementById('auth-err'); el.textContent = r.error; el.style.display = ''; }
+// ── Credential vault (AES-GCM, key derived from login password via PBKDF2) ────
+
+const VAULT_KEY = 'r42_vault';
+let _sessionKey = null; // CryptoKey — held in memory, never written to storage
+
+async function domainHash() {
+  const enc = new TextEncoder();
+  const buf = await crypto.subtle.digest('SHA-256', enc.encode(location.hostname));
+  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+// Binds the derived key to both the login password AND the current domain
+// (via a SHA-256 hash of location.hostname) — a vault saved on one site's
+// origin can't be decrypted even with the same password on a different site.
+async function deriveKey(password, salt) {
+  const enc  = new TextEncoder();
+  const dHash = await domainHash();
+  const base = await crypto.subtle.importKey('raw', enc.encode(password + '|' + dHash), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    {name: 'PBKDF2', salt, iterations: 200_000, hash: 'SHA-256'},
+    base, {name: 'AES-GCM', length: 256}, false, ['encrypt', 'decrypt']
+  );
+}
+
+async function vaultSave(data) {
+  if (!_sessionKey) return false;
+  try {
+    const enc  = new TextEncoder();
+    const iv   = crypto.getRandomValues(new Uint8Array(12));
+    const ct   = await crypto.subtle.encrypt({name:'AES-GCM', iv}, _sessionKey, enc.encode(JSON.stringify(data)));
+    const salt = _sessionKey._salt; // stashed below
+    localStorage.setItem(VAULT_KEY, JSON.stringify({
+      iv:   btoa(String.fromCharCode(...iv)),
+      ct:   btoa(String.fromCharCode(...new Uint8Array(ct))),
+      salt: btoa(String.fromCharCode(...salt)),
+    }));
+    return true;
+  } catch (e) {
+    console.warn('vaultSave failed:', e);
+    return false;
+  }
+}
+
+async function vaultLoad(password) {
+  const raw = localStorage.getItem(VAULT_KEY);
+  if (!raw) return null;
+  try {
+    const {iv, ct, salt} = JSON.parse(raw);
+    const saltBuf = Uint8Array.from(atob(salt), c => c.charCodeAt(0));
+    const key = await deriveKey(password, saltBuf);
+    const dec = await crypto.subtle.decrypt(
+      {name:'AES-GCM', iv: Uint8Array.from(atob(iv), c => c.charCodeAt(0))},
+      key, Uint8Array.from(atob(ct), c => c.charCodeAt(0))
+    );
+    _sessionKey = key; _sessionKey._salt = saltBuf;
+    return JSON.parse(new TextDecoder().decode(dec));
+  } catch { return null; }
+}
+
+async function vaultInit(password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  _sessionKey = await deriveKey(password, salt);
+  _sessionKey._salt = salt; // stash for re-use in vaultSave
+}
+
+async function vaultApplyToForms(data) {
+  if (!data) return;
+  const ids = {db_host:'db-host', db_port:'db-port', db_user:'db-user', db_pass:'db-pass', db_name:'db-name'};
+  for (const [k,id] of Object.entries(ids)) if (data[k]) document.getElementById(id).value = data[k];
+}
+
+// ── Auth ──────────────────────────────────────────────────────────────────────
+
+
 async function doLogout() {
+  _sessionKey = null;
   await fetch(API('logout'));
   location.reload();
 }
@@ -1365,18 +3068,672 @@ async function showApp() {
   document.getElementById('auth-screen').style.display = 'none';
   document.getElementById('main-app').style.display = '';
   renderStepsNav();
-  showTab('restore');
+  showTab('frameworkinfo');
+  loadSqlTabs();
   await loadFileList();
+  runAutoScan(); // fire-and-forget; populates Framework/Server Info panes
+}
+
+// ── Site Info (auto-scan) ─────────────────────────────────────────────────────
+
+const FW_COLORS = {
+  bitrix: '#f97316', wordpress: '#3b82f6', webasyst: '#22c55e',
+  modx: '#a855f7', opencart: '#14b8a6', joomla: '#ef4444', unknown: '#64748b'
+};
+
+async function runAutoScan() {
+  const fwBody = document.getElementById('frameworkinfo-body');
+  const svBody = document.getElementById('serverinfo-body');
+  if (!fwBody || !svBody) return;
+  fwBody.innerHTML = '<p style="color:#64748b;font-size:13px">Scanning…</p>';
+  svBody.innerHTML = '<p style="color:#64748b;font-size:13px">Scanning…</p>';
+
+  let scan;
+  try {
+    scan = await fetch(API('scan')).then(r => r.json());
+  } catch(e) {
+    fwBody.innerHTML = '<p style="color:#ef4444;font-size:13px">Scan failed: ' + e.message + '</p>';
+    svBody.innerHTML = '<p style="color:#ef4444;font-size:13px">Scan failed: ' + e.message + '</p>';
+    return;
+  }
+
+  // Ground truth for "which Bitrix site is current", straight from Bitrix's
+  // own kernel — the browser fetches this directly (not the server), since
+  // a server-side self-request would depend on exec/curl/allow_url_fopen,
+  // all routinely disabled on the shared hosting this tool targets, whereas
+  // the browser's own networking is always available. Never throws; on any
+  // failure the DB-query heuristic (domain match / first-enabled fallback)
+  // computed server-side in scan.bitrix_sites is left untouched.
+  if (scan.framework === 'bitrix' && (scan.bitrix_sites || []).length) {
+    try {
+      const siteId = await fetch(API('bitrix_site_id_internal')).then(r => r.ok ? r.text() : '');
+      const trimmed = siteId.trim();
+      if (trimmed && scan.bitrix_sites.some(s => s.site_id === trimmed)) {
+        scan.bitrix_sites.forEach(s => {
+          s.is_current = s.site_id === trimmed;
+          s.matched_by = s.site_id === trimmed ? 'kernel' : null;
+        });
+        scan.bitrix_kernel_verified = true;
+      } else {
+        scan.bitrix_kernel_verified = false;
+      }
+    } catch (e) {
+      scan.bitrix_kernel_verified = false;
+    }
+  }
+
+  fwData = scan;
+
+  // Update shared state & form pre-fills (same as after extract)
+  if (scan.framework && scan.framework !== 'unknown') {
+    document.getElementById('fw-select').value = scan.framework;
+    document.getElementById('topbar-fw').textContent = '🔍 ' + scan.framework;
+  }
+  if (scan.root) document.getElementById('fw-root').value = scan.root;
+  const creds = scan.db_credentials || {};
+  if (creds.db_host) document.getElementById('db-host').value = creds.db_host;
+  if (creds.db_port) document.getElementById('db-port').value = creds.db_port;
+  if (creds.db_user) document.getElementById('db-user').value = creds.db_user;
+  if (creds.db_pass) document.getElementById('db-pass').value = creds.db_pass;
+  if (creds.db_name) document.getElementById('db-name').value = creds.db_name;
+  // Also pre-fill the Backup tab's DB fields from the same detected credentials
+  if (creds.db_host) document.getElementById('bk-host').value = creds.db_host;
+  if (creds.db_port) document.getElementById('bk-port').value = creds.db_port;
+  if (creds.db_user) document.getElementById('bk-user').value = creds.db_user;
+  if (creds.db_pass) document.getElementById('bk-pass').value = creds.db_pass;
+  if (creds.db_name) document.getElementById('bk-db').value = creds.db_name;
+  // SQL Console fields are NOT auto-filled here — use the explicit
+  // "Use detected creds" button so it never silently overwrites a
+  // custom connection the user is actively typing/using.
+  // Persist to encrypted vault so next session auto-fills
+  const hasCreds = Object.keys(creds).length > 0;
+  const vaultSaved = hasCreds ? await vaultSave(creds) : false;
+
+  const fw = scan.framework || 'unknown';
+  const fwColor = FW_COLORS[fw] || '#64748b';
+  const hasFiles = (scan.files || 0) > 0;
+
+  // Show/hide the Bitrix-specific tools panel
+  const bitrixPanel = document.getElementById('bitrix-tools-panel');
+  if (bitrixPanel) bitrixPanel.style.display = (fw === 'bitrix') ? '' : 'none';
+  renderDevModeStatus(scan);
+
+  const credRows = hasCreds ? [
+    ['Host',     creds.db_host || '—'],
+    ['Port',     creds.db_port || 3306],
+    ['Database', creds.db_name || '—'],
+    ['User',     creds.db_user || '—'],
+    ['Password', creds.db_pass || ''],
+  ] : [];
+
+  const env = scan.server_env || {};
+  const extRows = Object.entries(env.extensions || {});
+  const toolRows = Object.entries(env.tools || {});
+  const dot = (ok) => `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${ok ? '#22c55e' : '#ef4444'};margin-right:6px"></span>`;
+
+  const bitrixSites = scan.bitrix_sites || [];
+  const externalSites = bitrixSites.filter(s => s.external_root);
+  const currentSite = bitrixSites.find(s => s.is_current);
+  const domainCheck = scan.bitrix_domain_check;
+
+  const backups = scan.backups || [];
+
+  fwBody.innerHTML = `
+    <div style="display:flex;flex-direction:column;gap:16px">
+      <div>
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:6px">Framework</div>
+        ${hasFiles
+          ? `<span style="display:inline-flex;align-items:center;gap:6px;background:${fwColor}22;color:${fwColor};border:1px solid ${fwColor}44;border-radius:6px;padding:6px 14px;font-weight:600;font-size:14px">${fw}</span>`
+          : `<span style="color:#64748b;font-size:13px">No files extracted yet</span>`}
+        ${scan.live_site ? `<span style="margin-left:8px;font-size:11px;color:#64748b">(detected from the live site — no backup extracted yet)</span>` : ''}
+        ${fw === 'bitrix' && scan.bitrix_version ? `<span style="margin-left:8px;font-size:12px;color:#94a3b8">core v${escHtml(scan.bitrix_version)}</span>` : ''}
+      </div>
+
+      ${hasFiles ? `
+      <div>
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:6px">Root</div>
+        <code style="font-size:11px;color:#94a3b8;word-break:break-all">${scan.root || '—'}</code>
+      </div>
+      <div style="display:flex;gap:32px;align-items:flex-end">
+        <div>
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:4px">Files</div>
+          <span style="font-size:13px;color:#e2e8f0">${scan.files?.toLocaleString() || 0}</span>
+        </div>
+        <div>
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:4px">Disk Size</div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <button class="btn btn-secondary btn-sm" id="dir-size-btn" onclick="countDirSize()">📏 Count</button>
+            <span id="dir-size-result" style="font-size:13px;color:#e2e8f0"></span>
+          </div>
+        </div>
+        ${scan.site_url ? `
+        <div>
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:4px">Site URL</div>
+          <a href="${escHtml(scan.site_url)}" target="_blank" style="font-size:13px">${escHtml(scan.site_url)}</a>
+        </div>` : ''}
+        ${scan.table_prefix ? `
+        <div>
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:4px">Table Prefix</div>
+          <code style="font-size:13px;color:#e2e8f0">${escHtml(scan.table_prefix)}</code>
+        </div>` : ''}
+      </div>` : ''}
+
+      ${hasCreds ? `
+      <div>
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:8px;display:flex;align-items:center;gap:8px">
+          DB Credentials <span style="color:#22c55e;font-size:10px;text-transform:none;letter-spacing:normal">(from config file)</span>
+          ${vaultSaved
+            ? `<span title="Encrypted and saved to browser storage — will auto-fill on next login" style="color:#22c55e;font-size:10px;text-transform:none;letter-spacing:normal;font-weight:600">🔒 saved to vault</span>`
+            : `<span title="Not persisted this page load — the vault key is only derived right after typing your password at login. Rescan after a fresh login, or use Unlock Vault." style="color:#facc15;font-size:10px;text-transform:none;letter-spacing:normal;font-weight:600">⚠ not saved <button onclick="unlockVault()" style="background:none;border:none;cursor:pointer;color:#facc15;text-decoration:underline;font-size:10px;padding:0">unlock</button></span>`}
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-size:13px">
+          ${credRows.map(([k,v]) => {
+            const isPass = k === 'Password';
+            const display = isPass
+              ? `<span id="si-pass" data-pw="${escHtml(v+'')}" style="font-family:monospace">${'•'.repeat(Math.min((v+'').length,12))}</span>
+                 <button onclick="siTogglePass()" style="background:none;border:none;cursor:pointer;color:#64748b;font-size:11px;margin-left:4px">show</button>`
+              : `<span style="font-family:monospace;color:#e2e8f0">${escHtml(v+'')}</span>`;
+            return `<tr>
+              <td style="color:#64748b;padding:4px 0;width:80px;vertical-align:top">${k}</td>
+              <td style="padding:4px 0">${display}</td>
+            </tr>`;
+          }).join('')}
+        </table>
+      </div>` : hasFiles ? `<div style="color:#64748b;font-size:13px">No DB credentials found in config files.</div>` : ''}
+
+      ${bitrixSites.length ? `
+      <div style="background:linear-gradient(135deg, #064e3b, #0d9488 55%, #f0fdfa); border-radius:12px; padding:2px">
+        <div style="background:#11141dee; border-radius:10px; padding:16px">
+
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#5eead4;margin-bottom:10px;font-weight:700">Bitrix — Domain Diagnosis</div>
+
+          <!-- Section 1: Main Module Settings -->
+          <div style="background:#0f1117;border:1px solid #2d3148;border-radius:8px;padding:14px;margin-bottom:12px">
+            <div style="font-size:13px;font-weight:700;color:#ffffff;margin-bottom:4px">📋 Main Module Settings <span style="font-weight:400;color:#64748b;font-size:11px">(b_option)</span></div>
+            <p style="font-size:12px;color:#94a3b8;margin-bottom:12px;line-height:1.5">main.server_name sets the <code>Domain</code> attribute on the session cookie (confirmed directly: Set-Cookie's domain= comes from this value) and is used to build absolute URLs outside of a request context — cron agents, notifications, RSS/sitemaps. Browsers reject a cookie whose Domain doesn't match the site actually being visited, so a stale value here silently breaks logins. It should match the domain this install is actually being reached on <em>right now</em>, since a stored value can go stale (e.g. after moving a site prod↔dev and forgetting to revert it back).</p>
+            ${domainCheck ? `
+              <div style="display:flex;flex-wrap:wrap;gap:20px;margin-bottom:10px">
+                <div>
+                  <div style="font-size:11px;color:#94a3b8;margin-bottom:3px">server_name (b_option)</div>
+                  <div style="font-family:monospace;font-size:14px;font-weight:700;color:${domainCheck.mismatch ? '#f87171' : '#4ade80'}">${escHtml(domainCheck.server_name || '(not set)')}</div>
+                </div>
+                <div>
+                  <div style="font-size:11px;color:#94a3b8;margin-bottom:3px">you're currently browsing via</div>
+                  <div style="font-family:monospace;font-size:14px;font-weight:700;color:#5eead4">${escHtml(domainCheck.current_host || '?')}</div>
+                </div>
+                <div>
+                  <div style="font-size:11px;color:#94a3b8;margin-bottom:3px">site_name (b_option, reference only)</div>
+                  <div style="font-family:monospace;font-size:14px;font-weight:700;color:#e2e8f0">${escHtml(domainCheck.site_name || '(not set)')}</div>
+                </div>
+              </div>
+              ${domainCheck.mismatch ? `
+                <div style="background:#7f1d1d55;border:1px solid #f87171;border-radius:6px;padding:10px 12px;color:#fecaca;font-size:13px;line-height:1.6">
+                  ⚠ <strong>server_name ("${escHtml(domainCheck.server_name)}") doesn't match the domain you're currently on ("${escHtml(domainCheck.current_host)}").</strong>
+                  If that's expected right now (e.g. you're mid prod↔dev move), ignore this. Otherwise, the session cookie's Domain is being set to "${escHtml(domainCheck.server_name)}" — browsers reject that on "${escHtml(domainCheck.current_host)}", so nobody can stay logged in until this is updated.
+                  <div style="margin-top:8px"><button class="btn btn-primary btn-sm" onclick="fixBitrixDomain()">Set server_name to "${escHtml(domainCheck.current_host)}"</button></div>
+                </div>` : `
+                <div style="background:#052e2255;border:1px solid #4ade80;border-radius:6px;padding:8px 12px;color:#bbf7d0;font-size:13px">✓ server_name matches the domain you're currently on — no mismatch here.</div>`}
+            ` : `<div style="color:#94a3b8;font-size:13px">Could not read b_option (connection failed or credentials missing).</div>`}
+          </div>
+
+          <!-- Section 2: Sites -->
+          <div style="background:#0f1117;border:1px solid #2d3148;border-radius:8px;padding:14px">
+            <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+              <div style="font-size:13px;font-weight:700;color:#ffffff">🌐 Sites <span style="font-weight:400;color:#64748b;font-size:11px">(b_lang)</span>
+                ${scan.bitrix_kernel_verified ? `<span title="ACTIVE below is confirmed directly from Bitrix's own kernel (SITE_ID) — not a guess." style="cursor:help;color:#4ade80;font-size:12px;margin-left:6px">✓ⓘ</span>` : ''}
+              </div>
+              <button class="btn btn-secondary btn-sm" onclick="verifyBitrixSite()">Re-verify via Bitrix core</button>
+            </div>
+            ${!scan.bitrix_kernel_verified ? `
+              <div style="background:#78350f55;border:1px solid #facc15;border-radius:6px;padding:8px 12px;color:#fde68a;font-size:13px;margin-bottom:10px">⚠ Could not verify the active site via Bitrix's kernel (bootstrap failed, or bitrix/header.php wasn't found here). ACTIVE below reflects a real domain match if one exists; DEFAULT reads b_lang's own DEF flag (Bitrix's recorded default site) as the fallback when no domain matched.</div>
+            ` : ''}
+            <div id="bitrix-verify-result" style="font-size:12px;margin-bottom:10px"></div>
+            ${externalSites.length ? `<div style="background:#78350f55;border:1px solid #facc15;border-radius:6px;padding:8px 12px;color:#fde68a;font-size:13px;margin-bottom:10px">⚠ ${externalSites.length} site(s) have a separate document root — back those up independently.</div>` : ''}
+            <table style="width:100%;border-collapse:separate;border-spacing:0 8px">
+              ${bitrixSites.map(s => {
+                const isActive = s.is_current && (s.matched_by === 'domain' || s.matched_by === 'kernel');
+                const border = isActive ? '#4ade80' : (s.is_default ? '#f97316' : '#2d3148');
+                const bg = isActive ? '#052e2255' : (s.is_default ? '#7c2d1233' : '#1a1d27');
+                return `
+                <tr id="bitrix-site-row-${escHtml(s.site_id)}" style="background:${bg}">
+                  <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};border-left:1px solid ${border};border-radius:8px 0 0 8px;padding:10px 12px;width:1%;white-space:nowrap">
+                    <span style="font-family:monospace;font-size:12px;color:#94a3b8;background:#0f1117;border-radius:4px;padding:2px 8px">${escHtml(s.site_id||'')}</span>
+                  </td>
+                  <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};padding:10px 12px;font-size:14px;font-weight:700;color:#e2e8f0">
+                    ${escHtml(s.domain || '(no domain set)')}
+                  </td>
+                  <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};padding:10px 12px;width:1%;white-space:nowrap;font-size:11px;font-weight:700;color:${s.active ? '#4ade80' : '#ef4444'}" title="b_lang.ACTIVE — is this site row enabled at all">
+                    ${s.active ? '● ENABLED' : '● DISABLED'}
+                  </td>
+                  <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};padding:10px 12px;width:1%;white-space:nowrap">
+                    ${isActive ? `<span style="font-size:11px;font-weight:700;color:#052e22;background:#4ade80;border-radius:4px;padding:2px 8px">ACTIVE${s.matched_by === 'kernel' ? ' ✓' : ''}</span>` : ''}
+                  </td>
+                  <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};padding:10px 12px;width:1%;white-space:nowrap" title="b_lang.DEF — Bitrix's own recorded default site">
+                    ${s.is_default ? `<span style="font-size:11px;font-weight:700;color:#ffffff;background:#f97316;border-radius:4px;padding:2px 8px">DEFAULT</span>` : ''}
+                  </td>
+                  <td style="border-top:1px solid ${border};border-bottom:1px solid ${border};border-right:1px solid ${border};border-radius:0 8px 8px 0;padding:10px 12px;width:1%;white-space:nowrap;font-family:monospace;font-size:11px;color:${s.external_root ? '#facc15' : 'transparent'}">
+                    ${s.external_root ? escHtml(s.doc_root) : ''}
+                  </td>
+                </tr>`;
+              }).join('')}
+            </table>
+          </div>
+
+        </div>
+      </div>` : ''}
+
+      ${(scan.sqls||[]).filter(s=>s.is_dump).length ? `
+      <div>
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:6px">SQL Dumps</div>
+        ${scan.sqls.filter(s=>s.is_dump).map(s=>`
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+            <span style="font-size:12px">🗃️</span>
+            <span style="font-size:13px;color:#e2e8f0">${escHtml(s.name)}</span>
+            <span style="font-size:11px;color:#64748b">${fmtSize(s.size)}</span>
+          </div>`).join('')}
+      </div>` : ''}
+
+      ${backups.length ? `
+      <div>
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:6px">Existing Backups</div>
+        ${backups.map(b => `
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">
+            <span style="font-size:12px">📦</span>
+            <span style="font-size:13px;color:#e2e8f0">${escHtml(b.timestamp)}</span>
+            <span style="font-size:11px;color:#64748b">${b.part_count > 1 ? b.part_count + ' parts, ' : ''}${fmtSize(b.total_size)}</span>
+            ${b.files.map(f => `<a href="${API('download_backup')}&file=${encodeURIComponent(f.name)}" style="font-size:11px" download>⬇ ${escHtml(f.name)}</a>`).join('')}
+          </div>`).join('')}
+      </div>` : ''}
+    </div>`;
+
+  const fnRows = Object.entries(env.functions || {});
+
+  svBody.innerHTML = `
+    <div style="display:flex;flex-direction:column;gap:16px">
+      ${env.is_nginx ? `
+      <div style="background:#facc1522;border:1px solid #facc1544;border-radius:8px;padding:12px 14px">
+        <div style="color:#facc15;font-size:13px;font-weight:600;margin-bottom:6px">⚠ nginx detected — .htaccess does not protect the work directory</div>
+        <p style="font-size:12px;color:#e2e8f0;margin-bottom:8px">This tool's <code>.restore/</code> directory (uploaded backups, extracted files, DB dumps) is normally blocked from direct web access via <code>.htaccess</code>, but nginx ignores that file entirely. Add this to your nginx server block:</p>
+        <pre style="font-size:11px;color:#e2e8f0;background:#0f1117;border-radius:6px;padding:10px;overflow-x:auto;white-space:pre-wrap">location ~ /\.restore/ {
+    deny all;
+    return 404;
+}</pre>
+      </div>` : ''}
+
+      <div>
+        <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:4px">PHP</div>
+        <div style="font-size:13px;color:#e2e8f0">${escHtml(env.php_version||'?')} · ${escHtml(env.server_software||'?')}</div>
+      </div>
+
+      <div style="display:flex;flex-wrap:wrap;gap:24px">
+        <div>
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:6px">Extensions</div>
+          ${extRows.map(([k,ok]) => `<div style="font-size:12px;margin-bottom:2px">${dot(ok)}${escHtml(k)}</div>`).join('')}
+        </div>
+        <div>
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:6px">PHP Functions</div>
+          ${fnRows.map(([k,ok]) => `<div style="font-size:12px;margin-bottom:2px">${dot(ok)}${escHtml(k)}</div>`).join('')}
+        </div>
+        <div>
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:6px">Shell tools</div>
+          ${toolRows.map(([k,ok]) => `<div style="font-size:12px;margin-bottom:2px">${dot(ok)}${escHtml(k)}</div>`).join('')}
+        </div>
+        ${scan.disk_free != null ? `
+        <div>
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:6px">Disk free</div>
+          <div style="font-size:13px;color:#e2e8f0">${fmtSize(scan.disk_free)}</div>
+        </div>` : ''}
+      </div>
+    </div>`;
+}
+
+async function unlockVault() {
+  const pw = prompt('Re-enter your restore password to unlock the credential vault for this session:');
+  if (!pw) return;
+  if (!window.crypto?.subtle) {
+    alert('WebCrypto is unavailable in this context (requires HTTPS) — the vault cannot be used here.');
+    return;
+  }
+  const existing = localStorage.getItem(VAULT_KEY);
+  if (existing) {
+    const saved = await vaultLoad(pw);
+    if (!saved) {
+      // Wrong password, or vault was saved under a different domain/salt — reinit fresh
+      await vaultInit(pw);
+    } else {
+      vaultApplyToForms(saved);
+    }
+  } else {
+    await vaultInit(pw);
+  }
+  runAutoScan();
+}
+
+async function countDirSize() {
+  const btn = document.getElementById('dir-size-btn');
+  const out = document.getElementById('dir-size-result');
+  if (!fwData.root) return;
+  btn.disabled = true;
+  out.textContent = 'Counting…';
+  const r = await post('dir_size', {dir: fwData.root});
+  btn.disabled = false;
+  out.textContent = r.ok ? fmtSize(r.size) : '✗ ' + r.error;
+}
+
+function renderDevModeStatus(scan) {
+  const badge = document.getElementById('devmode-badge');
+  const warn  = document.getElementById('devmode-domain-warning');
+  if (!badge) return;
+
+  const value = scan.bitrix_dev_mode; // 'Y' | 'N' | null
+  if (value === null || value === undefined) {
+    badge.textContent = 'Site mode: UNKNOWN';
+    badge.style.background = '#64748b22';
+    badge.style.color = '#64748b';
+  } else if (value === 'Y') {
+    badge.textContent = 'Site mode: DEV';
+    badge.style.background = '#22c55e22';
+    badge.style.color = '#22c55e';
+  } else {
+    badge.textContent = 'Site mode: PROD';
+    badge.style.background = '#ef444422';
+    badge.style.color = '#ef4444';
+  }
+
+  // Heuristic: a 3+ part domain (e.g. dev.example.com, test.example.com)
+  // often signals a staging/dev subdomain rather than the real production
+  // domain — flag it when the site is claiming to be PROD. Check the domain
+  // this admin tool is actually being browsed on (current_host), not the
+  // matched b_lang site's configured SERVER_NAME — those can differ (e.g.
+  // a hosting-panel preview subdomain pointed at a site whose real b_lang
+  // domain is already the production one).
+  if (warn) {
+    warn.style.display = 'none';
+    const domain = scan.current_host || '';
+    if (value === 'N' && domain && domain.split('.').length >= 3) {
+      warn.textContent = `⚠ You're browsing this tool via "${domain}", which has 3+ parts (looks like a dev/staging subdomain), but this site reports PROD mode — double check that's intentional.`;
+      warn.style.display = '';
+    }
+  }
+}
+
+async function toggleDevMode() {
+  if (!fwData.root) return;
+  if (!confirm('Toggle Bitrix developer mode (main.update_devsrv)?\n\nBitrix’s own documentation states this is tracked by their license servers and using it on a live production site is against license terms — only do this on a genuine dev/staging copy.\n\nContinue?')) return;
+  const badge = document.getElementById('devmode-badge');
+  badge.textContent = 'Toggling…';
+  const r = await post('bitrix_toggle_devmode', {dir: fwData.root});
+  if (!r.ok) {
+    badge.textContent = '✗ ' + r.error;
+    return;
+  }
+  fwData.bitrix_dev_mode = r.new;
+  renderDevModeStatus(fwData);
+}
+
+async function fixBitrixDomain() {
+  if (!fwData.root) return;
+  const check = fwData.bitrix_domain_check;
+  if (!confirm(`Set main.server_name to "${check?.current_host}" (the domain you're currently browsing this tool on)?\n\nThis directly modifies the b_option table. Continue?`)) return;
+  const r = await post('bitrix_fix_domain', {dir: fwData.root});
+  if (!r.ok) {
+    alert('✗ ' + r.error);
+    return;
+  }
+  runAutoScan();
+}
+
+async function verifyBitrixSite() {
+  // Kernel verification already runs automatically as part of every scan
+  // (runAutoScan() fetches bitrix_site_id_internal directly) — this button
+  // just re-triggers a fresh scan, useful if the first attempt failed
+  // transiently or after applying a fix.
+  const result = document.getElementById('bitrix-verify-result');
+  result.innerHTML = '<span style="color:#94a3b8">Re-checking…</span>';
+  await runAutoScan();
+}
+
+// ── SQL Console — tabbed, persisted to localStorage ────────────────────────────
+
+const SQL_TABS_KEY = 'r42_sql_tabs';
+let sqlTabs = [];
+let activeSqlTabId = null;
+
+function newSqlTab(name) {
+  return { id: 'tab_' + Math.random().toString(36).slice(2, 10), name: name || 'Tab', cells: [] };
+}
+
+function loadSqlTabs() {
+  try {
+    const raw = localStorage.getItem(SQL_TABS_KEY);
+    if (raw) {
+      const data = JSON.parse(raw);
+      if (Array.isArray(data.tabs) && data.tabs.length) {
+        sqlTabs = data.tabs;
+        activeSqlTabId = data.activeTabId && sqlTabs.some(t => t.id === data.activeTabId)
+          ? data.activeTabId : sqlTabs[0].id;
+        renderSqlTabsBar();
+        renderActiveSqlTabCells();
+        return;
+      }
+    }
+  } catch (e) { console.warn('Failed to load SQL tabs:', e); }
+  // First run / corrupted storage — start with one empty tab
+  const t = newSqlTab('Tab 1');
+  sqlTabs = [t];
+  activeSqlTabId = t.id;
+  saveSqlTabs();
+  renderSqlTabsBar();
+  renderActiveSqlTabCells();
+}
+
+function saveSqlTabs() {
+  try {
+    localStorage.setItem(SQL_TABS_KEY, JSON.stringify({ tabs: sqlTabs, activeTabId: activeSqlTabId }));
+  } catch (e) { console.warn('Failed to save SQL tabs:', e); }
+}
+
+function activeSqlTab() {
+  return sqlTabs.find(t => t.id === activeSqlTabId) || sqlTabs[0];
+}
+
+function renderSqlTabsBar() {
+  const bar = document.getElementById('sql-tabs-bar');
+  if (!bar) return;
+  bar.innerHTML = sqlTabs.map(t => `
+    <span style="display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:6px;cursor:pointer;font-size:12px;
+                  background:${t.id === activeSqlTabId ? '#1e2235' : 'transparent'};
+                  color:${t.id === activeSqlTabId ? '#818cf8' : '#94a3b8'};
+                  border:1px solid ${t.id === activeSqlTabId ? '#818cf8' : '#2d3148'}"
+          onclick="switchSqlTab('${t.id}')">
+      ${escHtml(t.name)}
+      <button onclick="event.stopPropagation();deleteSqlTab('${t.id}')" title="Delete tab"
+              style="background:none;border:none;cursor:pointer;color:inherit;opacity:.6;font-size:11px;padding:0;line-height:1">✕</button>
+    </span>`).join('')
+    + `<button class="btn btn-secondary btn-sm" onclick="addSqlTab()" style="padding:5px 10px">+ New Tab</button>`;
+}
+
+function switchSqlTab(id) {
+  activeSqlTabId = id;
+  saveSqlTabs();
+  renderSqlTabsBar();
+  renderActiveSqlTabCells();
+}
+
+function addSqlTab() {
+  const t = newSqlTab('Tab ' + (sqlTabs.length + 1));
+  sqlTabs.push(t);
+  switchSqlTab(t.id);
+}
+
+function deleteSqlTab(id) {
+  const t = sqlTabs.find(x => x.id === id);
+  if (t && t.cells.length && !confirm(`Delete "${t.name}" and its ${t.cells.length} cell(s)?`)) return;
+  sqlTabs = sqlTabs.filter(x => x.id !== id);
+  if (!sqlTabs.length) sqlTabs = [newSqlTab('Tab 1')];
+  if (activeSqlTabId === id) activeSqlTabId = sqlTabs[0].id;
+  saveSqlTabs();
+  renderSqlTabsBar();
+  renderActiveSqlTabCells();
+}
+
+function clearActiveSqlTab() {
+  const t = activeSqlTab();
+  if (t.cells.length && !confirm(`Clear all ${t.cells.length} cell(s) in "${t.name}"?`)) return;
+  t.cells = [];
+  saveSqlTabs();
+  renderActiveSqlTabCells();
+}
+
+function buildSqlResultHtml(r) {
+  if (!r.ok) {
+    return `<span style="color:#ef4444">✗ ${escHtml(r.error)}</span>`;
+  }
+  if (r.rows) {
+    if (!r.rows.length) return `<span style="color:#64748b">0 rows</span>`;
+    const cols = Object.keys(r.rows[0]);
+    return `<div style="overflow-x:auto"><table style="border-collapse:collapse;font-family:monospace;font-size:12px">
+      <tr>${cols.map(c => `<th style="text-align:left;padding:4px 10px;border-bottom:1px solid #2d3148;color:#94a3b8;white-space:nowrap">${escHtml(c)}</th>`).join('')}</tr>
+      ${r.rows.map(row => `<tr>${cols.map(c => `<td style="padding:4px 10px;border-bottom:1px solid #1e2235;color:#e2e8f0;white-space:nowrap">${row[c] === null ? '<span style="color:#64748b">NULL</span>' : escHtml(String(row[c]))}</td>`).join('')}</tr>`).join('')}
+    </table></div>
+    <div style="color:#64748b;margin-top:6px">${r.rows.length}${r.truncated ? '+' : ''} row(s)${r.truncated ? ' — truncated at 500' : ''}</div>`;
+  }
+  return `<span style="color:#22c55e">✓ ${r.affected} row(s) affected</span>`;
+}
+
+function sqlResultAsMarkdown(query, r) {
+  let md = '```sql\n' + query + '\n```\n\n';
+  if (!r.ok) {
+    md += `> Error: ${r.error}\n`;
+  } else if (r.rows) {
+    if (!r.rows.length) {
+      md += '_0 rows_\n';
+    } else {
+      const cols = Object.keys(r.rows[0]);
+      const esc = v => String(v).replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+      md += `| ${cols.join(' | ')} |\n`;
+      md += `|${cols.map(() => '---').join('|')}|\n`;
+      for (const row of r.rows) {
+        md += `| ${cols.map(c => row[c] === null ? 'NULL' : esc(row[c])).join(' | ')} |\n`;
+      }
+      if (r.truncated) md += `\n_truncated at 500 rows_\n`;
+    }
+  } else {
+    md += `_${r.affected} row(s) affected_\n`;
+  }
+  return md;
+}
+
+async function copySqlCellMarkdown(btn) {
+  const idx = Number(btn.dataset.cellIndex);
+  const cell = activeSqlTab().cells[idx];
+  if (!cell) return;
+  try {
+    await navigator.clipboard.writeText(sqlResultAsMarkdown(cell.query, cell.response));
+    const orig = btn.textContent;
+    btn.textContent = '✓ Copied';
+    setTimeout(() => { btn.textContent = orig; }, 1500);
+  } catch (e) {
+    alert('Copy failed: ' + e.message);
+  }
+}
+
+function renderActiveSqlTabCells() {
+  const cellsEl = document.getElementById('sql-cells');
+  const tab = activeSqlTab();
+  cellsEl.innerHTML = tab.cells.map((c, i) => sqlCellHtml(c.query, c.response, i)).join('');
+  cellsEl.scrollTop = cellsEl.scrollHeight;
+}
+
+// query/response are never embedded inline in the HTML (SQL text routinely
+// contains quotes) — the copy button looks itself up via data-cell-index
+// against the in-memory tab data instead.
+function sqlCellHtml(query, response, index) {
+  return `
+    <div>
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;background:#0f1117;border:1px solid #2d3148;border-radius:6px 6px 0 0;padding:8px 12px">
+        <pre style="font-family:monospace;font-size:12px;color:#818cf8;margin:0;white-space:pre-wrap;flex:1">${escHtml(query)}</pre>
+        <button data-cell-index="${index}" onclick="copySqlCellMarkdown(this)"
+                style="background:none;border:none;cursor:pointer;color:#64748b;font-size:11px;white-space:nowrap;padding:2px 4px" title="Copy query + result as Markdown">📋 Copy MD</button>
+      </div>
+      <div style="border:1px solid #2d3148;border-top:none;border-radius:0 0 6px 6px;padding:10px 12px;font-size:12px">${buildSqlResultHtml(response)}</div>
+    </div>`;
+}
+
+function useDetectedSqlCreds() {
+  const creds = fwData.db_credentials || {};
+  if (!Object.keys(creds).length) {
+    alert('No detected DB credentials available yet — run a scan first (Framework Info tab).');
+    return;
+  }
+  if (creds.db_host) document.getElementById('sql-host').value = creds.db_host;
+  if (creds.db_port) document.getElementById('sql-port').value = creds.db_port;
+  if (creds.db_user) document.getElementById('sql-user').value = creds.db_user;
+  if (creds.db_pass) document.getElementById('sql-pass').value = creds.db_pass;
+  if (creds.db_name) document.getElementById('sql-db').value = creds.db_name;
+}
+
+async function runSqlCell() {
+  const input = document.getElementById('sql-input');
+  const query = input.value.trim();
+  if (!query) return;
+  if (!sqlTabs.length) loadSqlTabs();
+
+  const cellsEl = document.getElementById('sql-cells');
+  cellsEl.insertAdjacentHTML('beforeend', `
+    <div id="sql-cell-pending">
+      <pre style="background:#0f1117;border:1px solid #2d3148;border-radius:6px 6px 0 0;padding:8px 12px;font-family:monospace;font-size:12px;color:#818cf8;margin:0;white-space:pre-wrap">${escHtml(query)}</pre>
+      <div style="border:1px solid #2d3148;border-top:none;border-radius:0 0 6px 6px;padding:10px 12px;font-size:12px">Running…</div>
+    </div>`);
+  cellsEl.scrollTop = cellsEl.scrollHeight;
+
+  const r = await post('run_sql', {
+    host: document.getElementById('sql-host').value,
+    port: document.getElementById('sql-port').value,
+    user: document.getElementById('sql-user').value,
+    pass: document.getElementById('sql-pass').value,
+    db:   document.getElementById('sql-db').value,
+    query,
+  });
+
+  activeSqlTab().cells.push({ query, response: r });
+  saveSqlTabs();
+  document.getElementById('sql-cell-pending')?.remove();
+  cellsEl.insertAdjacentHTML('beforeend', sqlCellHtml(query, r, activeSqlTab().cells.length - 1));
+  cellsEl.scrollTop = cellsEl.scrollHeight;
+  input.value = '';
+  input.focus();
+}
+
+function siTogglePass() {
+  const el   = document.getElementById('si-pass');
+  const btn  = el?.nextElementSibling;
+  const pass = el?.dataset.pw || '';
+  if (!el) return;
+  if (el.dataset.shown === '1') {
+    el.textContent = '•'.repeat(Math.min(pass.length, 12));
+    el.dataset.shown = '0';
+    if (btn) btn.textContent = 'show';
+  } else {
+    el.textContent = pass;
+    el.dataset.shown = '1';
+    if (btn) btn.textContent = 'hide';
+  }
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
 
 function showTab(tab) {
-  ['restore','backup'].forEach(t => {
+  ['restore','frameworkinfo','serverinfo','backup','sqlconsole'].forEach(t => {
     document.getElementById('pane-' + t).style.display = t === tab ? '' : 'none';
     document.getElementById('tab-' + t).classList.toggle('active', t === tab);
   });
-  document.getElementById('topbar-title').textContent = tab === 'restore' ? 'Restore Wizard' : 'Create Backup';
+  const titles = {restore: 'Restore Wizard', frameworkinfo: 'Framework Info', serverinfo: 'Server Info', backup: 'Create Backup', sqlconsole: 'SQL Console'};
+  document.getElementById('topbar-title').textContent = titles[tab] || tab;
 }
 
 // ── Steps nav ─────────────────────────────────────────────────────────────────
@@ -1441,6 +3798,7 @@ async function uploadFile(file) {
   let failed = false;
   let failReason = '';
   let ctrl = null;
+  let lastResp = null;
   document.getElementById(`${pbId}-cancel`).onclick = () => { cancelled = true; ctrl?.abort(); };
 
   const started = Date.now();
@@ -1482,6 +3840,7 @@ async function uploadFile(file) {
       break;
     }
     if (!resp.ok) { failed = true; failReason = `Server error ${resp.status}`; break; }
+    lastResp = await resp.json().catch(() => null);
     bytesDone += Math.min(CHUNK, file.size - c * CHUNK);
     lastPct = Math.round((c + 1) / chunks * 100);
     const elapsed = (Date.now() - started) / 1000 || 0.001;
@@ -1521,7 +3880,10 @@ async function uploadFile(file) {
   } else {
     div.querySelector('.file-icon').textContent = '✅';
     const total = (Date.now() - started) / 1000;
-    if (meta) meta.textContent = `Done · ${fmtSize(file.size)} in ${fmtTime(total)}`;
+    const verTag = lastResp?.verified === true  ? ' · 🔒 checksum ok'
+                 : lastResp?.verified === false ? ' · ⚠️ checksum MISMATCH'
+                 : '';
+    if (meta) meta.textContent = `Done · ${fmtSize(file.size)} in ${fmtTime(total)}${verTag}`;
   }
   await loadFileList();
 }
@@ -1543,13 +3905,16 @@ async function loadFileList() {
     const badge = {sql:'<span class="badge badge-blue">SQL</span>',
                    archive:'<span class="badge badge-green">Archive</span>',
                    part:'<span class="badge badge-yellow">Part</span>'}[f.type] || '';
+    const hashBadge = f.sha256full
+      ? `<span title="SHA-256: ${f.sha256full}" style="font-family:monospace;font-size:11px;color:#64748b;cursor:help">🔒 ${f.sha256}</span>`
+      : '';
     return `<li class="file-item">
       <span class="file-icon">${icon}</span>
       <div class="file-info">
         <div class="file-name">${f.name} ${badge}</div>
-        <div class="file-meta">${fmtSize(f.size)}</div>
+        <div class="file-meta">${fmtSize(f.size)} ${hashBadge}</div>
       </div>
-      <button class="btn btn-secondary btn-sm" onclick="deleteFile('${f.name}')">✕</button>
+      <button class="btn btn-secondary btn-sm" onclick="deleteFile(${JSON.stringify(f.name)})">✕</button>
     </li>`;
   }).join('') + '</ul>';
 }
@@ -1608,6 +3973,18 @@ async function doExtract() {
   document.getElementById('fw-select').value = scan.framework || 'unknown';
   document.getElementById('fw-root').value = scan.root || '';
   document.getElementById('topbar-fw').textContent = scan.framework !== 'unknown' ? '🔍 ' + scan.framework : '';
+
+  // Pre-fill DB credentials extracted from framework config file
+  const creds = scan.db_credentials || {};
+  if (Object.keys(creds).length) {
+    if (creds.db_host) document.getElementById('db-host').value = creds.db_host;
+    if (creds.db_port) document.getElementById('db-port').value = creds.db_port;
+    if (creds.db_user) document.getElementById('db-user').value = creds.db_user;
+    if (creds.db_pass) document.getElementById('db-pass').value = creds.db_pass;
+    if (creds.db_name) document.getElementById('db-name').value = creds.db_name;
+    log.innerHTML += `<div class="log-line log-ok">DB credentials read from config — host: ${creds.db_host || '?'}, db: ${creds.db_name || '?'}</div>`;
+    vaultSave(creds);
+  }
 }
 
 // ── SQL import ────────────────────────────────────────────────────────────────
@@ -1711,6 +4088,7 @@ async function doBackup() {
     db_pass:  document.getElementById('bk-pass').value,
     db_name:  document.getElementById('bk-db').value,
     split_mb: document.getElementById('bk-split').value,
+    db_only:  document.getElementById('bk-db-only').checked ? '1' : '',
   });
   if (!r.ok) { log.innerHTML += `<div class="log-line log-err">${r.error}</div>`; return; }
   (r.results||[]).forEach(l => log.innerHTML += `<div class="log-line log-ok">${l}</div>`);
@@ -1724,6 +4102,17 @@ async function doBackup() {
      <a href="${API('download_backup')}&file=${encodeURIComponent(f.name)}" class="btn btn-secondary btn-sm" download>⬇️</a>
     </div>`
   ).join('');
+}
+
+// ── Upstream scripts ─────────────────────────────────────────────────────────
+
+async function doGetUpstream(script) {
+  const out = document.getElementById('upstream-result');
+  out.textContent = 'Downloading…';
+  const r = await post('download_upstream', {script});
+  if (!r.ok) { out.textContent = '✗ ' + r.error; return; }
+  const path = location.pathname.replace(/\/[^/]*$/, '/') + r.file;
+  out.innerHTML = `✓ Saved — <a href="${path}" target="_blank">${r.file}</a> (${fmtSize(r.size)})`;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1758,7 +4147,6 @@ function fmtSize(b) {
   if (b >= 1024)       return (b/1024).toFixed(2) + ' KB';
   return b + ' B';
 }
-function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 function fmtTime(s) {
   if (!isFinite(s) || s < 0) return '…';
   if (s < 60) return Math.round(s) + 's';
