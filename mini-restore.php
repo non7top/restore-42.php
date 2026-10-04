@@ -923,6 +923,96 @@ if ($action === 'extract_status') {
     exit;
 }
 
+/**
+ * Detached database import, for dumps too big to load inside one request.
+ *
+ * Same reasoning as extract_start: the web server in front of PHP ends any
+ * request after about five minutes and the caller sees "fetch failed" while the
+ * work carries on unobserved, with no exit status anywhere. Here the import runs
+ * under nohup, writes its exit status to a marker file, and the caller polls
+ * import_status. The connection attempts (socket, then TCP, as in the
+ * synchronous path) are chained in the runner, because PHP is gone by the time
+ * the first one fails.
+ */
+if ($action === 'import_start') {
+    if (!function_exists('shell_exec')) {
+        echo json_encode(array('ok' => false, 'error' => 'shell_exec() is disabled - cannot detach the import'));
+        exit;
+    }
+    $sqlName = isset($_POST['sql']) ? basename($_POST['sql']) : '';
+    if (!preg_match('/^wru-backup-[0-9]{14}\.sql$/', $sqlName)) {
+        echo json_encode(array('ok' => false, 'error' => 'invalid sql filename'));
+        exit;
+    }
+    $sqlPath = $uploadDir . '/' . $sqlName;
+    if (!is_file($sqlPath)) {
+        echo json_encode(array('ok' => false, 'error' => 'sql file not found: ' . $sqlName));
+        exit;
+    }
+    $errFile = $uploadDir . '/.wru-import.err';
+    $doneFile = $uploadDir . '/.wru-import.done';
+    $pidFile = $uploadDir . '/.wru-import.pid';
+    $runnerFile = $uploadDir . '/.wru-import.sh';
+    @unlink($errFile);
+    @unlink($doneFile);
+
+    $dbHost = $WRU_DB_HOST !== '' ? $WRU_DB_HOST : 'localhost';
+    $dbPort = $WRU_DB_PORT !== '' ? $WRU_DB_PORT : '3306';
+    $attempts = wruMysqlConnAttempts($dbHost, $dbPort);
+    $connRegex = 'is not allowed to connect|Access denied|Can.t connect|Authentication requires secure connection|caching_sha2_password|Lost connection to MySQL server|Unknown MySQL server host|unknown option|unknown variable';
+    $sh = "#!/bin/sh\n";
+    $first = true;
+    foreach ($attempts as $label => $connArgs) {
+        $marker = 'echo "--- attempt: ' . str_replace('"', '', $label) . '" >> ' . escapeshellarg($errFile) . "\n";
+        // --default-character-set=binary and MYSQL_PWD: see the synchronous path.
+        $run = 'MYSQL_PWD=' . escapeshellarg($WRU_DB_PASS) . ' ' . wruMysqlBin() . ' --default-character-set=binary ' . $connArgs .
+            ' -u ' . escapeshellarg($WRU_DB_USER) . ' ' . escapeshellarg($WRU_DB_NAME) .
+            ' < ' . escapeshellarg($sqlPath) . ' 2>> ' . escapeshellarg($errFile) . "\n";
+        if ($first) {
+            $sh .= $marker . $run . 'RC=$?' . "\n";
+            $first = false;
+            continue;
+        }
+        // Only a connection-level refusal is worth another transport; anything
+        // else would fail the same way and re-import half the dump.
+        $sh .= 'if [ $RC -ne 0 ] && grep -qiE ' . escapeshellarg($connRegex) . ' ' . escapeshellarg($errFile) . ' 2>/dev/null; then' . "\n";
+        $sh .= '  ' . $marker . '  ' . $run . '  RC=$?' . "\n" . 'fi' . "\n";
+    }
+    $sh .= 'echo $RC > ' . escapeshellarg($doneFile) . "\n";
+    // The runner carries the database password; removed by import_status.
+    if (@file_put_contents($runnerFile, $sh) === false) {
+        echo json_encode(array('ok' => false, 'error' => 'could not write the import runner'));
+        exit;
+    }
+    @chmod($runnerFile, 0700);
+    $cmd = 'nohup sh ' . escapeshellarg($runnerFile) . ' > /dev/null 2>&1 & echo $!';
+    $pid = trim(shell_exec($cmd));
+    @file_put_contents($pidFile, $pid);
+    echo json_encode(array('ok' => true, 'pid' => $pid, 'sql' => $sqlName, 'size' => filesize($sqlPath)));
+    exit;
+}
+
+if ($action === 'import_status') {
+    $errFile = $uploadDir . '/.wru-import.err';
+    $doneFile = $uploadDir . '/.wru-import.done';
+    $pidFile = $uploadDir . '/.wru-import.pid';
+    $runnerFile = $uploadDir . '/.wru-import.sh';
+    $finished = is_file($doneFile);
+    $exit = $finished ? (int) trim(file_get_contents($doneFile)) : null;
+    if ($finished) {
+        @unlink($runnerFile);
+    }
+    $err = is_file($errFile) ? trim((string) file_get_contents($errFile)) : '';
+    echo json_encode(array(
+        'ok' => true,
+        'running' => !$finished && is_file($pidFile),
+        'finished' => $finished,
+        'exit_code' => $exit,
+        'output' => substr($err, 0, 4000),
+    ));
+    exit;
+}
+
 if ($action === 'restore') {
     if (!function_exists('exec')) {
         echo json_encode(array('ok' => false, 'error' => 'exec() is disabled on this host — cannot shell out to tar/mysql'));
