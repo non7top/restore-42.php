@@ -939,9 +939,7 @@ if ($sqlName !== null) {
 // there is no database at all (a genuinely static site still needs its files).
 if ($sqlName !== null) {
     $sh .= 'if [ $DUMPRC -eq 0 ]; then' . "\n";
-    $sh .= '  tar' . $excludeArgs . ' -czf ' . escapeshellarg($archivePath) .
-        ' -C ' . escapeshellarg($docRoot) . ' . > ' . escapeshellarg($tarOutFile) . " 2>&1\n";
-    $sh .= '  echo $? > ' . escapeshellarg($tarCodeFile) . "\n";
+    $sh .= wruTarShell($excludeArgs, $archivePath, $docRoot, $tarOutFile, $tarCodeFile);
     $sh .= 'else' . "\n";
     // A code file the status action can read, so "skipped" is reported as such
     // rather than as a tar that silently never ran.
@@ -950,9 +948,7 @@ if ($sqlName !== null) {
         escapeshellarg($tarOutFile) . "\n";
     $sh .= 'fi' . "\n";
 } else {
-    $sh .= 'tar' . $excludeArgs . ' -czf ' . escapeshellarg($archivePath) .
-        ' -C ' . escapeshellarg($docRoot) . ' . > ' . escapeshellarg($tarOutFile) . " 2>&1\n";
-    $sh .= 'echo $? > ' . escapeshellarg($tarCodeFile) . "\n";
+    $sh .= wruTarShell($excludeArgs, $archivePath, $docRoot, $tarOutFile, $tarCodeFile);
 }
 $sh .= 'touch ' . escapeshellarg($doneFile) . "\n";
 

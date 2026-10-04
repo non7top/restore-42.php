@@ -739,6 +739,71 @@ if ($action === 'fetch') {
     exit;
 }
 
+// Detached checksum of one wru-backup-* file. A 12 GB archive takes longer to
+// hash than the web server lets one request live, so the hash runs under nohup
+// and the caller polls hash_status. The size check alone cannot tell a
+// byte-exact copy from one that is the right length and wrong inside.
+if ($action === 'hash_start') {
+    if (!function_exists('shell_exec')) {
+        echo json_encode(array('ok' => false, 'error' => 'shell_exec() is disabled - cannot detach a checksum'));
+        exit;
+    }
+    $name = isset($_POST['name']) ? basename($_POST['name']) : '';
+    if (!preg_match('/^wru-backup-[0-9]{14}\.(tar\.gz(\.[0-9]{3})?|sql)$/', $name)) {
+        echo json_encode(array('ok' => false, 'error' => 'invalid filename'));
+        exit;
+    }
+    $path = $uploadDir . '/' . $name;
+    if (!is_file($path)) {
+        echo json_encode(array('ok' => false, 'error' => 'file not found: ' . $name));
+        exit;
+    }
+    $algo = (isset($_POST['algo']) && $_POST['algo'] === 'sha1') ? 'sha1' : 'sha256';
+    $tool = $algo . 'sum';
+    $probe = array();
+    $probeCode = 1;
+    @exec('command -v ' . $tool . ' 2>/dev/null', $probe, $probeCode);
+    if ($probeCode !== 0) {
+        echo json_encode(array('ok' => false, 'error' => $tool . ' is not installed on this host'));
+        exit;
+    }
+    $out = $path . '.hash';
+    $doneMarker = $path . '.hash.done';
+    @unlink($out);
+    @unlink($doneMarker);
+    $cmd = 'nohup sh -c ' . escapeshellarg(
+        $tool . ' ' . escapeshellarg($path) . ' > ' . escapeshellarg($out) . ' 2>&1; echo $? > ' . escapeshellarg($doneMarker)
+    ) . ' > /dev/null 2>&1 & echo $!';
+    $pid = trim(shell_exec($cmd));
+    echo json_encode(array('ok' => true, 'pid' => $pid, 'name' => $name, 'algo' => $algo));
+    exit;
+}
+
+if ($action === 'hash_status') {
+    $name = isset($_POST['name']) ? basename($_POST['name']) : '';
+    if (!preg_match('/^wru-backup-[0-9]{14}\.(tar\.gz(\.[0-9]{3})?|sql)$/', $name)) {
+        echo json_encode(array('ok' => false, 'error' => 'invalid filename'));
+        exit;
+    }
+    $path = $uploadDir . '/' . $name;
+    $out = $path . '.hash';
+    $doneMarker = $path . '.hash.done';
+    if (!is_file($doneMarker)) {
+        echo json_encode(array('ok' => true, 'done' => false));
+        exit;
+    }
+    $rc = trim(file_get_contents($doneMarker));
+    $text = is_file($out) ? trim(file_get_contents($out)) : '';
+    $parts = preg_split('/\s+/', $text);
+    $hash = isset($parts[0]) ? strtolower($parts[0]) : '';
+    if ($rc === '0' && preg_match('/^[0-9a-f]{40}$|^[0-9a-f]{64}$/', $hash)) {
+        echo json_encode(array('ok' => true, 'done' => true, 'hash' => $hash, 'size' => filesize($path)));
+    } else {
+        echo json_encode(array('ok' => false, 'done' => true, 'error' => 'checksum tool failed (exit ' . $rc . '): ' . substr($text, 0, 200)));
+    }
+    exit;
+}
+
 if ($action === 'upload') {
     if (!isset($_FILES['file']) || $_FILES['file']['error'] !== UPLOAD_ERR_OK) {
         echo json_encode(array('ok' => false, 'error' => 'no file uploaded'));
