@@ -239,7 +239,7 @@ if ($wru_token === '' || $wru_token !== $WRU_TOKEN) {
 $file = isset($_GET['file']) ? $_GET['file'] : '';
 // Filename only — no path separators, no traversal. mini-backup.php only
 // ever generates names matching this shape.
-if ($file === '' || !preg_match('/^wru-backup-[0-9]{14}\.(tar\.gz|sql)$/', $file)) {
+if ($file === '' || !preg_match('/^wru-backup-[0-9]{14}\.(tar\.gz(\.[0-9]{3})?|sql)$/', $file)) {
     header('HTTP/1.1 400 Bad Request');
     header('Content-Type: application/json');
     echo json_encode(array('ok' => false, 'error' => 'invalid filename'));

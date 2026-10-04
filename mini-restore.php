@@ -593,6 +593,35 @@ $action = isset($_REQUEST['action']) ? $_REQUEST['action'] : '';
 // fails outright, almost certainly PHP's own default upload_max_filesize/
 // post_max_size limits (typically 2-8MB) rejecting it. A direct fetch has
 // no such limit and skips an unnecessary double-hop.
+/** How to feed a staged archive to tar.
+ *
+ * $archiveName is the logical name (wru-backup-<ts>.tar.gz). The backup is
+ * normally staged as parts, name.tar.gz.000, .001, ...; a host whose split could
+ * not number its output stages the single file. Returns the shell text to put
+ * before tar and the argument for tar -f, or null with $error set. A gap in the
+ * numbering is refused here: the shell glob would skip the missing part and tar
+ * would fail much later, in the middle of a half-extracted docroot. */
+function wruArchiveSource($uploadDir, $archiveName, &$error)
+{
+    $base = $uploadDir . '/' . $archiveName;
+    if (is_file($base)) {
+        return array('prefix' => '', 'file' => escapeshellarg($base));
+    }
+    $parts = @glob($base . '.[0-9][0-9][0-9]');
+    if (!is_array($parts) || count($parts) === 0) {
+        $error = 'archive not found: ' . $archiveName;
+        return null;
+    }
+    sort($parts);
+    foreach ($parts as $i => $partPath) {
+        if (substr($partPath, -3) !== sprintf('%03d', $i)) {
+            $error = 'archive part ' . sprintf('%03d', $i) . ' is missing (found ' . basename($partPath) . ' in its place)';
+            return null;
+        }
+    }
+    return array('prefix' => 'cat ' . escapeshellarg($base) . '.[0-9][0-9][0-9] | ', 'file' => '-');
+}
+
 if ($action === 'fetch') {
     if (!function_exists('exec')) {
         echo json_encode(array('ok' => false, 'error' => 'exec() is disabled on this host — cannot shell out to curl'));
@@ -600,7 +629,7 @@ if ($action === 'fetch') {
     }
     $url = isset($_POST['url']) ? $_POST['url'] : '';
     $name = isset($_POST['name']) ? basename($_POST['name']) : '';
-    if (!preg_match('/^wru-backup-[0-9]{14}\.(tar\.gz|sql)$/', $name)) {
+    if (!preg_match('/^wru-backup-[0-9]{14}\.(tar\.gz(\.[0-9]{3})?|sql)$/', $name)) {
         echo json_encode(array('ok' => false, 'error' => 'invalid destination filename'));
         exit;
     }
@@ -716,7 +745,7 @@ if ($action === 'upload') {
         exit;
     }
     $name = isset($_POST['name']) ? basename($_POST['name']) : basename($_FILES['file']['name']);
-    if (!preg_match('/^wru-backup-[0-9]{14}\.(tar\.gz|sql)$/', $name)) {
+    if (!preg_match('/^wru-backup-[0-9]{14}\.(tar\.gz(\.[0-9]{3})?|sql)$/', $name)) {
         echo json_encode(array('ok' => false, 'error' => 'invalid destination filename'));
         exit;
     }
@@ -750,9 +779,10 @@ if ($action === 'extract_start') {
         echo json_encode(array('ok' => false, 'error' => 'invalid archive filename'));
         exit;
     }
-    $archivePath = $uploadDir . '/' . $archiveName;
-    if (!is_file($archivePath)) {
-        echo json_encode(array('ok' => false, 'error' => 'archive not found: ' . $archiveName));
+    $archiveError = '';
+    $archiveSrc = wruArchiveSource($uploadDir, $archiveName, $archiveError);
+    if ($archiveSrc === null) {
+        echo json_encode(array('ok' => false, 'error' => $archiveError));
         exit;
     }
     $log = $uploadDir . '/.wru-extract.log';
@@ -788,7 +818,7 @@ if ($action === 'extract_start') {
     // unambiguous. Without that, two members would extract to the same path and
     // whichever tar wrote last would win -- and if that were the archive's stock
     // .htaccess.restore, the site's real rules would be silently lost.
-        'tar -xzf ' . escapeshellarg($archivePath) . ' ' . ' --transform=' . escapeshellarg('s|^\./\.htaccess$|./.htaccess.restore|') . ' --exclude=./.htaccess.restore ' . ' -C ' . escapeshellarg($realDocRoot)
+        $archiveSrc['prefix'] . 'tar -xzf ' . $archiveSrc['file'] . ' ' . ' --transform=' . escapeshellarg('s|^\./\.htaccess$|./.htaccess.restore|') . ' --exclude=./.htaccess.restore ' . ' -C ' . escapeshellarg($realDocRoot)
         . ' > ' . escapeshellarg($log) . ' 2>&1; echo $? > ' . escapeshellarg($done)
     ) . ' > /dev/null 2>&1 & echo $!';
     $pid = trim(shell_exec($cmd));
@@ -845,13 +875,14 @@ if ($action === 'restore') {
             echo json_encode(array('ok' => false, 'error' => 'invalid archive filename'));
             exit;
         }
-        $archivePath = $uploadDir . '/' . $archiveName;
-        if (!is_file($archivePath)) {
-            echo json_encode(array('ok' => false, 'error' => 'archive not found: ' . $archiveName));
+        $archiveError = '';
+        $archiveSrc = wruArchiveSource($uploadDir, $archiveName, $archiveError);
+        if ($archiveSrc === null) {
+            echo json_encode(array('ok' => false, 'error' => $archiveError));
             exit;
         }
         // Same anchored rename as the detached path above; see the comment there.
-        $extractCmd = 'tar -xzf ' . escapeshellarg($archivePath) . ' ' . ' --transform=' . escapeshellarg('s|^\./\.htaccess$|./.htaccess.restore|') . ' --exclude=./.htaccess.restore ' . ' -C ' . escapeshellarg($realDocRoot) . ' 2>&1';
+        $extractCmd = $archiveSrc['prefix'] . 'tar -xzf ' . $archiveSrc['file'] . ' ' . ' --transform=' . escapeshellarg('s|^\./\.htaccess$|./.htaccess.restore|') . ' --exclude=./.htaccess.restore ' . ' -C ' . escapeshellarg($realDocRoot) . ' 2>&1';
         $extractOut = array();
         $extractCode = 0;
         exec($extractCmd, $extractOut, $extractCode);

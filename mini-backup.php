@@ -470,6 +470,30 @@ function wruIsTransportError($text)
     return false;
 }
 
+/** Shell that archives the docroot as 2047 MB parts (name.tar.gz.000, .001, ...).
+ *
+ * One 12 GB file cannot be resumed or re-fetched piecemeal: a fetch that ended
+ * mid-way and was resumed produced a file of exactly the right size and the
+ * wrong sha256, and the only remedy was fetching all 12 GB again. Parts are
+ * checked one by one, so a bad one costs one part. 2047 MiB stays under 2 GiB,
+ * the limit of the older 32-bit tools on some hosts.
+ *
+ * The tar exit status is taken inside the pipeline's subshell, because a
+ * pipeline reports the status of split, not of tar. Where split cannot number
+ * its output the old single file is written instead. */
+function wruTarShell($excludeArgs, $archivePath, $docRoot, $tarOutFile, $tarCodeFile)
+{
+    $sh  = 'if split --help 2>&1 | grep -q -- "--numeric-suffixes"; then' . "\n";
+    $sh .= '  ( tar' . $excludeArgs . ' -czf - -C ' . escapeshellarg($docRoot) . ' . 2> ' . escapeshellarg($tarOutFile) .
+        '; echo $? > ' . escapeshellarg($tarCodeFile) . ' ) | split -b 2047m -d -a 3 - ' . escapeshellarg($archivePath . '.') . "\n";
+    $sh .= 'else' . "\n";
+    $sh .= '  tar' . $excludeArgs . ' -czf ' . escapeshellarg($archivePath) .
+        ' -C ' . escapeshellarg($docRoot) . ' . > ' . escapeshellarg($tarOutFile) . " 2>&1\n";
+    $sh .= '  echo $? > ' . escapeshellarg($tarCodeFile) . "\n";
+    $sh .= 'fi' . "\n";
+    return $sh;
+}
+
 /** One full pass through every connection-transport candidate, retrying only
  * on a transport-level failure. Factored out so the --routines/--events
  * fallback below can reuse it with a different $dumpBase. */
@@ -616,7 +640,23 @@ if ($action === 'status') {
     $tarOut = is_file($tarOutFile) ? trim(file_get_contents($tarOutFile)) : '';
     $sqlErr = is_file($sqlErrFile) ? trim(file_get_contents($sqlErrFile)) : '';
 
+    // A split archive is name.tar.gz.000, .001, ...; the single file is the
+    // fallback for a host whose split cannot number its output. Parts exist
+    // while tar is still running (the last one partial), so a caller only uses
+    // the list once `done` is set.
+    $archiveParts = array();
     $archiveSize = wru_filesize($archivePath);
+    $partPaths = @glob($archivePath . '.[0-9][0-9][0-9]');
+    if (is_array($partPaths) && count($partPaths) > 0) {
+        sort($partPaths);
+        $total = 0;
+        foreach ($partPaths as $partPath) {
+            $partSize = wru_filesize($partPath);
+            $archiveParts[] = array('name' => basename($partPath), 'size' => $partSize);
+            $total += (float) $partSize;
+        }
+        $archiveSize = sprintf('%.0f', $total);
+    }
     $sqlSize = wru_filesize($sqlPath);
 
     // "Finished" is the runner's own done marker, not just the presence of
@@ -637,12 +677,77 @@ if ($action === 'status') {
         'ok' => true,
         'done' => $done,
         'stamp' => $stamp,
-        'archive' => array('name' => $archiveName, 'size' => $archiveSize, 'code' => $tarCode),
+        'archive' => array('name' => $archiveName, 'size' => $archiveSize, 'code' => $tarCode, 'parts' => $archiveParts),
         'sql' => $wantsSql ? array('name' => $sqlName, 'size' => $sqlSize, 'code' => $sqlCode) : null,
         'success' => $done && $archiveOk && $sqlOk,
         'tar_output' => $tarOut,
         'db_output' => $sqlErr,
     ));
+    exit;
+}
+
+// Detached checksum of one wru-backup-* file. A 12 GB archive takes longer to
+// hash than the web server lets one request live, so the hash runs under nohup
+// and the caller polls hash_status. The size check alone cannot tell a
+// byte-exact copy from one that is the right length and wrong inside.
+if ($action === 'hash_start') {
+    if (!function_exists('shell_exec')) {
+        echo json_encode(array('ok' => false, 'error' => 'shell_exec() is disabled - cannot detach a checksum'));
+        exit;
+    }
+    $name = isset($_POST['name']) ? basename($_POST['name']) : '';
+    if (!preg_match('/^wru-backup-[0-9]{14}\.(tar\.gz(\.[0-9]{3})?|sql)$/', $name)) {
+        echo json_encode(array('ok' => false, 'error' => 'invalid filename'));
+        exit;
+    }
+    $path = $backupDir . '/' . $name;
+    if (!is_file($path)) {
+        echo json_encode(array('ok' => false, 'error' => 'file not found: ' . $name));
+        exit;
+    }
+    $algo = (isset($_POST['algo']) && $_POST['algo'] === 'sha1') ? 'sha1' : 'sha256';
+    $tool = $algo . 'sum';
+    $probe = array();
+    $probeCode = 1;
+    @exec('command -v ' . $tool . ' 2>/dev/null', $probe, $probeCode);
+    if ($probeCode !== 0) {
+        echo json_encode(array('ok' => false, 'error' => $tool . ' is not installed on this host'));
+        exit;
+    }
+    $out = $path . '.hash';
+    $doneMarker = $path . '.hash.done';
+    @unlink($out);
+    @unlink($doneMarker);
+    $cmd = 'nohup sh -c ' . escapeshellarg(
+        $tool . ' ' . escapeshellarg($path) . ' > ' . escapeshellarg($out) . ' 2>&1; echo $? > ' . escapeshellarg($doneMarker)
+    ) . ' > /dev/null 2>&1 & echo $!';
+    $pid = trim(shell_exec($cmd));
+    echo json_encode(array('ok' => true, 'pid' => $pid, 'name' => $name, 'algo' => $algo));
+    exit;
+}
+
+if ($action === 'hash_status') {
+    $name = isset($_POST['name']) ? basename($_POST['name']) : '';
+    if (!preg_match('/^wru-backup-[0-9]{14}\.(tar\.gz(\.[0-9]{3})?|sql)$/', $name)) {
+        echo json_encode(array('ok' => false, 'error' => 'invalid filename'));
+        exit;
+    }
+    $path = $backupDir . '/' . $name;
+    $out = $path . '.hash';
+    $doneMarker = $path . '.hash.done';
+    if (!is_file($doneMarker)) {
+        echo json_encode(array('ok' => true, 'done' => false));
+        exit;
+    }
+    $rc = trim(file_get_contents($doneMarker));
+    $text = is_file($out) ? trim(file_get_contents($out)) : '';
+    $parts = preg_split('/\s+/', $text);
+    $hash = isset($parts[0]) ? strtolower($parts[0]) : '';
+    if ($rc === '0' && preg_match('/^[0-9a-f]{40}$|^[0-9a-f]{64}$/', $hash)) {
+        echo json_encode(array('ok' => true, 'done' => true, 'hash' => $hash, 'size' => wru_filesize($path)));
+    } else {
+        echo json_encode(array('ok' => false, 'done' => true, 'error' => 'checksum tool failed (exit ' . $rc . '): ' . substr($text, 0, 200)));
+    }
     exit;
 }
 
@@ -749,7 +854,7 @@ $purged = array();
 $existing = @glob($backupDir . '/wru-backup-*');
 if (is_array($existing)) {
     foreach ($existing as $old) {
-        if (preg_match('/wru-backup-[0-9]{14}\.(tar\.gz|sql)$/', $old) && @unlink($old)) {
+        if (preg_match('/wru-backup-[0-9]{14}\.(tar\.gz(\.[0-9]{3})?|sql)(\.hash(\.done)?)?$/', $old) && @unlink($old)) {
             $purged[] = basename($old);
         }
     }
