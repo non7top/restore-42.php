@@ -661,6 +661,27 @@ if ($action === 'fetch') {
     // the next attempt would have discarded all of it and begun again.
     // With resume, each call continues where the last stopped, so repeated
     // calls converge -- see wr-util's transferBackup, which loops on this.
+    // A request the web server killed does not kill the curl it started, so a
+    // retry can find the previous transfer still writing. Two curls appending to
+    // one file leave it longer than the source and corrupt (12565852864 bytes
+    // for a 12565639872-byte archive). If the file is still growing, say so and
+    // let the caller wait.
+    if (isset($_POST['restart']) && $_POST['restart'] === '1') {
+        @unlink($dest);
+    } elseif (is_file($dest)) {
+        clearstatcache();
+        $sizeA = filesize($dest);
+        sleep(3);
+        clearstatcache();
+        $sizeB = filesize($dest);
+        if ($sizeB !== $sizeA) {
+            if ($curlCfg !== '') {
+                @unlink($curlCfg);
+            }
+            echo json_encode(array('ok' => false, 'busy' => true, 'size' => $sizeB, 'output' => 'a previous fetch is still writing this file'));
+            exit;
+        }
+    }
     $before = is_file($dest) ? filesize($dest) : 0;
     $fetchCmd = 'curl -sS -f -L -C - ';
     if ($curlCfg !== '') {
